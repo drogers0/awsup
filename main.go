@@ -264,7 +264,15 @@ func selectFromList[T any](label string, items []T, key func(T) (id, name string
 	}
 	render := func(t T) string {
 		id, name := key(t)
+		if name == "" || name == id {
+			return id
+		}
 		return name + " (" + id + ")"
+	}
+	if len(items) == 1 {
+		id, name = key(items[0])
+		fmt.Printf("Auto-selected %s: %s\n", label, render(items[0]))
+		return id, name
 	}
 	fmt.Printf("Available %s:\n", label)
 	for i, it := range items {
@@ -353,15 +361,40 @@ Flags:
 	checkTransportErr(err)
 
 	if up.Policy == nil {
-		// Direct-grant user: no policy list — prompt for IDs and friendly names separately.
+		// Direct-grant user: no group-based policy.
 		if accountID == "" {
 			accountID = mustPromptLine("Enter AWS account ID: ")
 		}
-		accountName = mustPromptLine("Enter account name (display): ")
-		if roleID == "" {
-			roleID = mustPromptLine("Enter permission set ARN: ")
+		label := mustPromptLine(fmt.Sprintf("Account display name [%s]: ", accountID))
+		if label == "" {
+			accountName = accountID
+		} else {
+			accountName = label
 		}
-		roleName = mustPromptLine("Enter permission set name (display): ")
+
+		// Fetch permission sets from getMgmtPermissions; fall back to manual entry.
+		mgmtPerms, err := policy.GetMgmtPermissions(ctx, client)
+		checkTransportErr(err)
+
+		if roleID == "" {
+			if len(mgmtPerms) > 0 {
+				roleID, roleName = selectFromList("permission sets", mgmtPerms, permissionKey)
+			} else {
+				roleID = mustPromptLine("Enter permission set ARN: ")
+				roleName = roleID
+			}
+		} else {
+			// --role flag provided: try to match against mgmtPerms list.
+			if len(mgmtPerms) > 0 {
+				if id, name, ok := resolveByIDOrName(mgmtPerms, roleID, permissionKey); ok {
+					roleID, roleName = id, name
+				} else {
+					roleName = roleID
+				}
+			} else {
+				roleName = roleID
+			}
+		}
 	} else {
 		if accountID == "" {
 			accountID, accountName = selectFromList("accounts", up.Policy.Accounts, accountKey)
