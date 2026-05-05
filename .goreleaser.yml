@@ -1,0 +1,34 @@
+version: 2
+
+builds:
+  - binary: awsup
+    main: .
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - format: binary
+    name_template: "{{ .Os }}-{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+# Homebrew tap: once https://github.com/drogers0/homebrew-tap is created,
+# add a brews section here, for example:
+#
+# brews:
+#   - name: awsup
+#     repository:
+#       owner: drogers0
+#       name: homebrew-tap
+#     homepage: https://github.com/drogers0/awsup
+#     description: CLI for submitting and tracking AWS TEAM elevated-access requests
