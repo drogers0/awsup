@@ -131,7 +131,7 @@ type createRequestsInput struct {
 	Duration      string `json:"duration"`
 	StartTime     string `json:"startTime"`
 	Justification string `json:"justification"`
-	TicketNo      string `json:"ticketNo,omitempty"`
+	TicketNo      string `json:"ticketNo"`
 }
 
 type createRequestsVars struct {
@@ -353,15 +353,15 @@ Flags:
 	checkTransportErr(err)
 
 	if up.Policy == nil {
-		// Direct-grant user: accept whatever the caller supplied as both ID and name.
+		// Direct-grant user: no policy list — prompt for IDs and friendly names separately.
 		if accountID == "" {
 			accountID = mustPromptLine("Enter AWS account ID: ")
 		}
-		accountName = accountID
+		accountName = mustPromptLine("Enter account name (display): ")
 		if roleID == "" {
 			roleID = mustPromptLine("Enter permission set ARN: ")
 		}
-		roleName = roleID
+		roleName = mustPromptLine("Enter permission set name (display): ")
 	} else {
 		if accountID == "" {
 			accountID, accountName = selectFromList("accounts", up.Policy.Accounts, accountKey)
