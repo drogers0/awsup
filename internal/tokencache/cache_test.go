@@ -65,6 +65,7 @@ func TestGetValid_FreshCache(t *testing.T) {
 	)
 	c := &Cache{
 		IDToken:     jwt,
+		AccessToken: "access-token", // required for fast path (avoids realtime auth break)
 		ExpiresAt:   time.Now().Add(2 * time.Hour),
 		AppClientID: "test-client",
 		UserPoolID:  "us-east-1_test",

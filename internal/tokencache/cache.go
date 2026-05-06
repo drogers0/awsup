@@ -134,7 +134,7 @@ func GetValid(cachePath, appClientID, userPoolID, hostedUIDomain string) (*Cache
 		c = nil
 	}
 
-	if c != nil && time.Until(c.ExpiresAt) > 60*time.Second {
+	if c != nil && c.AccessToken != "" && time.Until(c.ExpiresAt) > 60*time.Second {
 		return c, nil
 	}
 
