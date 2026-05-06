@@ -82,39 +82,6 @@ func Get(ctx context.Context, c *appsync.Client, userID string, groupIDs []strin
 	return data.GetUserPolicy, nil
 }
 
-const getMgmtPermissionsQuery = `
-query GetMgmtPermissions {
-  getMgmtPermissions {
-    permissions
-    __typename
-  }
-}`
-
-type getMgmtPermissionsResponse struct {
-	Permissions []string `json:"permissions"`
-}
-
-type getMgmtPermissionsData struct {
-	GetMgmtPermissions *getMgmtPermissionsResponse `json:"getMgmtPermissions"`
-}
-
-// GetMgmtPermissions returns the permission set ARNs available for direct-grant
-// users. Returns an empty slice (not an error) if none are configured.
-func GetMgmtPermissions(ctx context.Context, c *appsync.Client) ([]Permission, error) {
-	data, err := appsync.Execute[getMgmtPermissionsData](ctx, c, getMgmtPermissionsQuery, nil)
-	if err != nil {
-		return nil, fmt.Errorf("getMgmtPermissions: %w", err)
-	}
-	if data.GetMgmtPermissions == nil {
-		return nil, nil
-	}
-	perms := make([]Permission, 0, len(data.GetMgmtPermissions.Permissions))
-	for _, arn := range data.GetMgmtPermissions.Permissions {
-		perms = append(perms, Permission{Name: arn, ID: arn})
-	}
-	return perms, nil
-}
-
 // onPublishPolicySubscription has no arguments; auth is carried in the
 // Sec-WebSocket-Protocol header and in the start-message extensions.
 const onPublishPolicySubscription = `

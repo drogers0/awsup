@@ -460,28 +460,11 @@ Flags:
 			}
 		}
 
-		// Fetch permission sets from getMgmtPermissions; fall back to manual entry.
-		mgmtPerms, err := policy.GetMgmtPermissions(ctx, client)
-		checkTransportErr(err)
-
 		if roleID == "" {
-			if len(mgmtPerms) > 0 {
-				roleID, roleName = selectFromList("permission sets", mgmtPerms, permissionKey)
-			} else {
-				roleID = mustPromptLine("Enter permission set ARN: ")
-				roleName = roleID
-			}
-		} else {
-			// --role flag provided: try to match against mgmtPerms list.
-			if roleName == "" && len(mgmtPerms) > 0 {
-				if id, name, ok := resolveByIDOrName(mgmtPerms, roleID, permissionKey); ok {
-					roleID, roleName = id, name
-				} else {
-					roleName = roleID
-				}
-			} else if roleName == "" {
-				roleName = roleID
-			}
+			roleID = mustPromptLine("Enter permission set ARN: ")
+			roleName = roleID
+		} else if roleName == "" {
+			roleName = roleID
 		}
 	} else {
 		if accountID == "" {
@@ -659,11 +642,6 @@ Flags:
 		result.Permissions = up.Policy.Permissions
 	} else {
 		result.PolicyType = "direct_grant"
-		perms, err := policy.GetMgmtPermissions(ctx, client)
-		checkTransportErr(err)
-		if len(perms) > 0 {
-			result.Permissions = perms
-		}
 		rtCtx, cancel := context.WithTimeout(ctx, realtimeEntitlementTimeout)
 		defer cancel()
 		rtPolicy, rtErr := getRealtimeEntitlements(rtCtx, client, tokens.UserID, tokens.GroupIDs)
@@ -671,31 +649,7 @@ Flags:
 			fmt.Fprintf(os.Stderr, "Debug: realtime entitlements: %v\n", rtErr)
 		} else if rtPolicy != nil {
 			result.Accounts = rtPolicy.Accounts
-			// Merge realtime permission display names into the mgmt ARN list by ID.
-			// Realtime entries enrich mgmt (which may have ARN-only names); entries
-			// not present in mgmt are appended.
-			if len(rtPolicy.Permissions) > 0 {
-				rtByID := make(map[string]policy.Permission, len(rtPolicy.Permissions))
-				for _, rp := range rtPolicy.Permissions {
-					rtByID[rp.ID] = rp
-				}
-				seen := make(map[string]bool)
-				merged := make([]policy.Permission, 0, len(result.Permissions))
-				for _, m := range result.Permissions {
-					if rp, ok := rtByID[m.ID]; ok {
-						merged = append(merged, rp)
-					} else {
-						merged = append(merged, m)
-					}
-					seen[m.ID] = true
-				}
-				for _, rp := range rtPolicy.Permissions {
-					if !seen[rp.ID] {
-						merged = append(merged, rp)
-					}
-				}
-				result.Permissions = merged
-			}
+			result.Permissions = rtPolicy.Permissions
 		}
 	}
 

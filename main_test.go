@@ -378,7 +378,6 @@ type requestServer struct {
 	mu           sync.Mutex
 	bodies       []string
 	createdInput map[string]any
-	mgmtCalled   bool
 }
 
 func newRequestServer(t *testing.T, accountID, accountName, roleID, roleName string) *requestServer {
@@ -478,13 +477,6 @@ func newDirectGrantServer(t *testing.T) *requestServer {
 		case strings.Contains(req.Query, "GetUserPolicy"):
 			json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
 				"getUserPolicy": map[string]any{"id": "u1", "username": "user@example.com", "policy": nil},
-			}})
-		case strings.Contains(req.Query, "GetMgmtPermissions"):
-			rs.mu.Lock()
-			rs.mgmtCalled = true
-			rs.mu.Unlock()
-			json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
-				"getMgmtPermissions": map[string]any{"permissions": []string{"arn:aws:sso:::permissionSet/ssoins/ps-abc"}},
 			}})
 		case strings.Contains(req.Query, "ValidateRequest"):
 			json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
@@ -649,37 +641,6 @@ func TestRequest_PolicyFetched_WhenAllFlagsProvided(t *testing.T) {
 	}
 }
 
-func TestRequestDirectFallback_RealtimeUnavailable_ManualFallback(t *testing.T) {
-	home := t.TempDir()
-	rs := newDirectGrantServer(t)
-	env := setupRequestEnv(t, home, rs.srv.URL, "test-client", "us-east-1_pool")
-
-	stdout, stderr, code := runBinEnvInput(env, "\n",
-		"request",
-		"--account", "123456789012",
-		"--duration", "4",
-		"--justification", "x",
-		"--yes",
-	)
-	if code != 0 {
-		t.Fatalf("exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
-	}
-	if !strings.Contains(stderr, "entitlement autodiscovery failed") {
-		t.Fatalf("expected realtime attempt debug log, got stderr: %s", stderr)
-	}
-
-	rs.mu.Lock()
-	defer rs.mu.Unlock()
-	if !rs.mgmtCalled {
-		t.Fatal("expected getMgmtPermissions fallback to be called")
-	}
-	if rs.createdInput == nil {
-		t.Fatal("expected createRequests to be called")
-	}
-	if got := rs.createdInput["roleId"]; got != "arn:aws:sso:::permissionSet/ssoins/ps-abc" {
-		t.Fatalf("unexpected roleId from fallback: %v", got)
-	}
-}
 
 func TestRequestDirectFallback_FlagsCompleteSkipsRealtime(t *testing.T) {
 	home := t.TempDir()
