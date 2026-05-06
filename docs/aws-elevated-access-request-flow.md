@@ -21,6 +21,17 @@ The deployment-specific identifiers (frontend URL, AppSync endpoint, Cognito IDs
 | OAuth redirect | `${TEAM_COGNITO_OAUTH_REDIRECT}` |
 | Identity Pool | `${TEAM_COGNITO_IDENTITY_POOL_ID}` |
 
+## Token Types and Their Uses
+
+The Cognito Hosted UI authorization-code + PKCE exchange returns two tokens relevant to this API:
+
+| Token | Claim `token_use` | Used for |
+|---|---|---|
+| **ID token** | `id` | All AppSync **HTTP** GraphQL requests (`Authorization` header) |
+| **Access token** | `access` | AppSync **WebSocket** realtime subscriptions (`Sec-WebSocket-Protocol` auth header) |
+
+Both tokens are JWTs signed by Cognito. AppSync validates the signature and audience (`aud` / `client_id`) and rejects the wrong token type for each channel — using the ID token on a WebSocket connection returns `connection_error: unauthorized`.
+
 ## Prerequisites
 
 ### Organizational access
@@ -50,7 +61,7 @@ access-control-allow-headers: content-type,authorization,x-amz-user-agent
 access-control-allow-methods: POST
 ```
 
-To obtain the ID token, complete the Cognito Hosted UI Authorization Code + PKCE flow. The federated IdP routes through enterprise SSO + TOTP MFA — this cannot be automated. The `/oauth2/token` code exchange returns the `id_token` JWT that all GraphQL requests carry. The id_token also contains `userId` and `groupIds` as custom claims (IAM Identity Center identifiers), injected by the User Pool at issuance; callers never need to resolve these separately.
+To obtain tokens, complete the Cognito Hosted UI Authorization Code + PKCE flow. The federated IdP routes through enterprise SSO + TOTP MFA — this cannot be automated. The `/oauth2/token` code exchange returns both the `id_token` and `access_token` JWTs. The `id_token` carries all HTTP GraphQL calls; the `access_token` is required for WebSocket subscriptions (see [Token Types and Their Uses](#token-types-and-their-uses)). Both tokens contain `userId` and `groupIds` as custom claims (IAM Identity Center identifiers), injected by the User Pool at issuance; callers never need to resolve these separately.
 
 ## Common Request Shape
 
@@ -70,6 +81,134 @@ Every call is the same shape — only the GraphQL query/variables change.
 **Body:** `{ "query": "<GraphQL document>", "variables": { … } }`
 
 The user identity (`username`, `email`, the implicit `owner` on records created) is taken from the JWT claims server-side — clients never pass identity in the body.
+
+## Entitlement Discovery (Page Load)
+
+Before the request form is usable, the UI determines what accounts and permission sets the user is eligible to request. This is a separate pre-request flow that precedes `validateRequest`/`createRequests`.
+
+### `getUserPolicy` — group-policy vs direct-grant detection
+
+```graphql
+query GetUserPolicy($userId: String, $groupIds: [String]) {
+  getUserPolicy(userId: $userId, groupIds: $groupIds) {
+    id
+    policy {
+      accounts { name id __typename }
+      permissions { name id __typename }
+      approvalRequired
+      duration
+      __typename
+    }
+    username
+    __typename
+  }
+}
+```
+
+**Variables:** `{ "userId": "<identity-store-user-id>", "groupIds": ["<group-id>", …] }`
+
+**Response (group-policy user):** `policy` is a non-null object with `accounts` and `permissions` arrays — the client populates the form dropdowns from these directly.
+
+**Response (direct-grant user):** `policy` is `null`. This is **not** an error. It means the user has been granted accounts via a direct Identity Center assignment rather than group membership. Entitlements must be discovered via realtime subscription (see below).
+
+### `getMgmtPermissions` — management permission sets (direct-grant only)
+
+For direct-grant users, an additional query returns the set of permission-set ARNs configured for management grants:
+
+```graphql
+query GetMgmtPermissions {
+  getMgmtPermissions {
+    permissions
+    __typename
+  }
+}
+```
+
+**Response:** `{ "getMgmtPermissions": { "permissions": ["arn:aws:sso:::permissionSet/…", …] } }`
+
+This returns ARN strings only — no display names. Display names for these permission sets come from the `onPublishPolicy` realtime subscription (see below). If `getMgmtPermissions` returns an empty list, the user must enter the ARN manually.
+
+### `onPublishPolicy` — realtime entitlement subscription (direct-grant only)
+
+For direct-grant users, the UI subscribes to an AppSync realtime event that delivers the user's actual entitlements (account + permission set pairs). This uses the AppSync WebSocket realtime endpoint, which is distinct from the HTTP GraphQL endpoint.
+
+#### WebSocket endpoint and authentication
+
+| | HTTP (GraphQL queries/mutations) | WebSocket (realtime subscriptions) |
+|---|---|---|
+| Endpoint | `https://<id>.appsync-api.<region>.amazonaws.com/graphql` | `wss://<id>.appsync-realtime-api.<region>.amazonaws.com/graphql` |
+| Auth token | **ID token** (`Authorization` header) | **Access token** (`Sec-WebSocket-Protocol` header) |
+
+Auth for the WebSocket channel is carried entirely in the `Sec-WebSocket-Protocol` HTTP upgrade header — **not** in the URL, query parameters, or `connection_init` payload. Passing the ID token here returns `connection_error: unauthorized`; the access token is required.
+
+The subprotocol list sent in the header:
+```
+Sec-WebSocket-Protocol: graphql-ws, header-<base64({"Authorization":"<access-token>","host":"<appsync-realtime-host>"})>
+```
+
+The base64 payload is standard (not URL-safe) encoding of a JSON object with exactly two keys: `Authorization` (the access token, no `Bearer` prefix) and `host` (the realtime hostname, e.g. `abc.appsync-realtime-api.us-east-1.amazonaws.com`).
+
+#### Frame protocol (graphql-ws / subscriptions-transport-ws)
+
+```
+CLIENT → { "type": "connection_init" }
+SERVER → { "type": "connection_ack" }
+CLIENT → { "id": "1", "type": "start", "payload": <start-payload> }
+SERVER → { "id": "1", "type": "start_ack" }   (may be omitted)
+SERVER → { "type": "ka" }                      (keepalive; ignore)
+SERVER → { "id": "1", "type": "data", "payload": { "data": { "onPublishPolicy": { … } } } }
+CLIENT → { "id": "1", "type": "complete" }     (client closes after first usable frame)
+```
+
+The `start` message payload is a JSON object with two keys:
+- `data`: JSON string of `{ "query": "<subscription-document>", "variables": {} }`
+- `extensions.authorization`: object with `Authorization` (access token), `host`, and `x-amz-user-agent`
+
+#### Subscription document
+
+```graphql
+subscription OnPublishPolicy {
+  onPublishPolicy {
+    id
+    policy {
+      accounts { name id __typename }
+      permissions { name id __typename }
+      approvalRequired
+      duration
+      __typename
+    }
+    username
+    __typename
+  }
+}
+```
+
+Note: **no arguments**. The server returns entitlements for the authenticated user based on the access token. The subscription does not accept `userId` or `groupIds` parameters.
+
+#### Response structure
+
+The `data` payload within a `data` frame:
+
+```json
+{
+  "data": {
+    "onPublishPolicy": {
+      "id": "<policy-id>",
+      "username": "<cognito-username>",
+      "policy": [
+        {
+          "accounts": [{ "name": "My Account", "id": "123456789012" }],
+          "permissions": [{ "name": "PowerUserAccess", "id": "arn:aws:sso:::permissionSet/…" }],
+          "approvalRequired": true,
+          "duration": "8"
+        }
+      ]
+    }
+  }
+}
+```
+
+`policy` is a **list of entitlement objects**, where each typically represents one `(account, permission set)` pair. A user with access to N accounts across M permission sets may receive up to N×M entitlement objects — the client deduplicates across the list. A usable payload has at least one non-empty `accounts` or `permissions` list; the client waits for the first usable frame and closes the subscription.
 
 ## The Flow
 
@@ -271,41 +410,71 @@ The newly-created record is returned with `status: "pending"`, `approvers: null`
 
 ## Sequence
 
+### Group-policy users
+
 ```
+PAGE LOAD
+        │
+        ▼
+[0] query getUserPolicy                         ──► { policy: { accounts: […], permissions: […] } }
+        │  (populates form dropdowns)
+        ▼
+USER CLICKS "SUBMIT"
+        │
+        ▼
+[1] mutation validateRequest                    ──► { valid: true, reason: "Group membership" }
+        │  (entitlement check)
+        ▼
+[2] mutation createRequests                     ──► { id: <uuid>, status: "pending", … }
+        │
+        ▼
+[3] query getSettings / [4] query requestByEmailAndStatus (×N)
+```
+
+### Direct-grant users
+
+```
+PAGE LOAD
+        │
+        ▼
+[0a] query getUserPolicy                        ──► { policy: null }  (direct-grant signal)
+[0b] query getMgmtPermissions                   ──► { permissions: ["arn:…", …] }
+[0c] WebSocket → subscribe onPublishPolicy      ──► { policy: [{ accounts:[…], permissions:[…] }] }
+        │  (access token in Sec-WebSocket-Protocol header; first usable frame returned)
+        │  (deduplicates entitlement list into account/permission set dropdowns)
+        ▼
 USER CLICKS "SUBMIT"
         │
         ▼
 [1] mutation validateRequest                    ──► { valid: true, reason: "Direct account grant" }
-        │  (entitlement check)
         ▼
-[2] mutation createRequests                     ──► { id: <uuid>, status: "pending", username, owner, … }
-        │  (DynamoDB write; triggers backend approval workflow)
-        ▼
-USER REDIRECTED TO "MY REQUESTS"
+[2] mutation createRequests                     ──► { id: <uuid>, status: "pending", … }
         │
         ▼
-[3] query getSettings (id="settings")           ──► UI policy + admin group config
-[4] query requestByEmailAndStatus               ──► [pending request, prior history]
-        │
-        ▼  (polled on focus / interval)
-[4'] query requestByEmailAndStatus (×N)         ──► picks up approvers[] / status changes
+[3] query getSettings / [4] query requestByEmailAndStatus (×N)
 ```
 
 ## Authentication Summary
 
-| Step | Auth | Notes |
-|---|---|---|
-| Cognito Hosted UI sign-in | Federated SAML/OIDC via `${TEAM_COGNITO_IDP_NAME}` | Out of band; produces a User Pool ID token |
-| All GraphQL calls (Steps 1–4) | `Authorization: <ID JWT>` | Same token reused; AppSync verifies signature, expiry, and audience (`aud == ${TEAM_COGNITO_APP_CLIENT_ID}`) |
+| Step | Channel | Token | Notes |
+|---|---|---|---|
+| Cognito Hosted UI sign-in | HTTPS redirect | — | Federated SAML/OIDC; produces ID token + access token |
+| `getUserPolicy`, `getMgmtPermissions` | HTTP POST | **ID token** | `Authorization` header, no `Bearer` prefix |
+| `validateRequest`, `createRequests` | HTTP POST | **ID token** | Same |
+| `getSettings`, `requestByEmailAndStatus` | HTTP POST | **ID token** | Same |
+| `onPublishPolicy` subscription | WebSocket | **Access token** | `Sec-WebSocket-Protocol: graphql-ws, header-<b64>` |
 
-There are no other tokens, no CSRF tokens, no per-request nonces. The JWT is the entire credential. Token lifetime is the user-pool default (1 hour for ID tokens unless customized); the Amplify SDK silently refreshes via the refresh token.
+There are no CSRF tokens or per-request nonces. Token lifetime is the user-pool default (1 hour); the Amplify SDK silently refreshes via the refresh token stored in browser localStorage.
 
 ## Caveats
 
 - This is an **internal** API — undocumented and tenant-specific. The schema can change with any redeploy of the TEAM stack.
 - HAR exports do not include `Authorization` (Chrome's HAR exporter strips `Cookie` and `Authorization` by default). The auth contract above was confirmed by probing the endpoint, not by reading captured headers.
 - `userId` and `groupIds` in `validateRequest` are custom claims in the Cognito ID token (`userId`: string, `groupIds`: comma-separated string with trailing comma). They are injected at token issuance by the User Pool and are available directly from the JWT — no Identity Store API calls required.
-- `accountName` and `role` (display name) are convenience fields the client populates from a separate account/permission-set listing; only `accountId` and `roleId` are authoritative.
+- `accountName` and `role` (display name) are convenience fields the client populates from entitlement discovery; only `accountId` and `roleId` are authoritative.
 - The `email` GSI key is case-sensitive. Use the exact casing from the JWT `email` claim, not lower-cased.
 - The federated IdP forces enterprise SSO; there is no direct Cognito sign-in path for human users on this deployment.
 - Request mutation uses an AppSync `@auth(rules: [{ allow: owner, ownerField: "owner" }])`-style rule keyed on the JWT `cognito:username` claim — you can only see/modify your own request rows unless you hold a privileged group membership (`teamAdminGroup` / `teamAuditorGroup`).
+- **WebSocket auth pitfall:** Passing the ID token (not the access token) in the `Sec-WebSocket-Protocol` header results in an immediate `connection_error` frame; the error message does not distinguish wrong-token-type from wrong-token-value.
+- **gorilla/websocket behavior:** After any read error (including a deadline timeout), the gorilla/websocket library marks the connection permanently failed. Subsequent `ReadJSON` calls panic with "repeated read on failed websocket connection". Set `SetReadDeadline` once to the context deadline rather than in a polling loop.
+- **`onPublishPolicy` has no arguments.** An earlier assumption that it accepted `$userId`/`$groupIds` parameters was wrong — the server filters entitlements from the access token identity, not caller-provided IDs. Passing variables to this subscription is silently ignored or errors.

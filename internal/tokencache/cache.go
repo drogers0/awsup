@@ -20,6 +20,7 @@ var ErrSessionExpired = errors.New("session expired — please sign into TEAM in
 // Cache holds a persisted Cognito session.
 type Cache struct {
 	IDToken      string    `json:"idToken"`
+	AccessToken  string    `json:"accessToken,omitempty"`
 	RefreshToken string    `json:"refreshToken"`
 	ExpiresAt    time.Time `json:"expiresAt"`
 	UserPoolID   string    `json:"userPoolId"`
@@ -104,6 +105,7 @@ func Refresh(c *Cache, hostedUIDomain string) (*Cache, error) {
 
 	newCache := &Cache{
 		IDToken:      rr.IDToken,
+		AccessToken:  rr.AccessToken,
 		RefreshToken: c.RefreshToken,
 		ExpiresAt:    tokens.Expiry,
 		UserPoolID:   c.UserPoolID,
@@ -154,6 +156,7 @@ func GetValid(cachePath, appClientID, userPoolID, hostedUIDomain string) (*Cache
 	}
 	fresh := &Cache{
 		IDToken:      tokens.IDToken,
+		AccessToken:  tokens.AccessToken,
 		RefreshToken: tokens.RefreshToken,
 		ExpiresAt:    tokens.Expiry,
 		UserPoolID:   userPoolID,

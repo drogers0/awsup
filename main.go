@@ -27,12 +27,15 @@ import (
 // -X main.version={{.Version}}
 var version = "dev"
 
+const realtimeEntitlementTimeout = 7 * time.Second
+
 const usage = `Usage:
   awsup [--profile <name>] <command> [flags]
 
 Commands:
   init      Auto-discover config from your browser session
   request   Submit an elevated-access request
+  options   List available accounts and permission sets
   list      List your requests
   settings  Show deployment settings
   profile   Manage profiles
@@ -204,6 +207,9 @@ func checkTransportErr(err error) {
 // prompt — fatal for piped multi-line input.
 var stdinReader = bufio.NewReader(os.Stdin)
 
+// getRealtimeEntitlements is replaceable in tests to avoid live realtime connections.
+var getRealtimeEntitlements = policy.GetOnPublishPolicyEntitlements
+
 // promptLine reads a line from stdin and reports whether stdin was open.
 // Returns ("", false) on EOF / closed stdin so callers can distinguish that
 // from a user pressing Enter on an empty line.
@@ -298,6 +304,14 @@ func formatChoices[T any](items []T, key func(T) (id, name string)) string {
 	return strings.Join(parts, ", ")
 }
 
+func newAuthenticatedClient(cfg *config.Config, tokens *tokencache.Cache) *appsync.Client {
+	c := appsync.New(cfg.AppSyncEndpoint, cfg.FrontendURL, cfg.AmplifyUserAgent, tokens.IDToken)
+	if tokens.AccessToken != "" {
+		c.SetAccessToken(tokens.AccessToken)
+	}
+	return c
+}
+
 func accountKey(a policy.Account) (string, string)       { return a.ID, a.Name }
 func permissionKey(p policy.Permission) (string, string) { return p.ID, p.Name }
 
@@ -312,6 +326,59 @@ func formatAge(d time.Duration) string {
 	default:
 		return fmt.Sprintf("%dd", int(d.Hours()/24))
 	}
+}
+
+func applyRealtimeDirectGrantChoices(accountID, roleID string, ent *policy.Policy) (string, string, string, string) {
+	if ent == nil {
+		return accountID, "", roleID, ""
+	}
+	var accountName, roleName string
+	if len(ent.Accounts) > 0 {
+		if accountID == "" {
+			accountID, accountName = selectFromList("accounts", ent.Accounts, accountKey)
+		} else if id, name, ok := resolveByIDOrName(ent.Accounts, accountID, accountKey); ok {
+			accountID, accountName = id, name
+		}
+	}
+	if len(ent.Permissions) > 0 {
+		if roleID == "" {
+			roleID, roleName = selectFromList("permission sets", ent.Permissions, permissionKey)
+		} else if id, name, ok := resolveByIDOrName(ent.Permissions, roleID, permissionKey); ok {
+			roleID, roleName = id, name
+		}
+	}
+	return accountID, accountName, roleID, roleName
+}
+
+// looksLikeRawIDs returns true when accountID is a 12-digit AWS account number
+// and roleID starts with "arn:", meaning both are already resolved and realtime
+// lookup can be skipped.
+func looksLikeRawIDs(accountID, roleID string) bool {
+	if len(accountID) != 12 {
+		return false
+	}
+	for _, c := range accountID {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return strings.HasPrefix(roleID, "arn:")
+}
+
+func resolveDirectGrantFromRealtime(ctx context.Context, client *appsync.Client, userID string, groupIDs []string, accountID, roleID string) (string, string, string, string, error) {
+	// Defensive fast-path: callers should use looksLikeRawIDs before calling,
+	// but guard here too so the function is safe to call standalone.
+	if looksLikeRawIDs(accountID, roleID) {
+		return accountID, "", roleID, "", nil
+	}
+	rtCtx, cancel := context.WithTimeout(ctx, realtimeEntitlementTimeout)
+	defer cancel()
+	rtPolicy, err := getRealtimeEntitlements(rtCtx, client, userID, groupIDs)
+	if err != nil {
+		return accountID, "", roleID, "", err
+	}
+	resolvedAccountID, resolvedAccountName, resolvedRoleID, resolvedRoleName := applyRealtimeDirectGrantChoices(accountID, roleID, rtPolicy)
+	return resolvedAccountID, resolvedAccountName, resolvedRoleID, resolvedRoleName, nil
 }
 
 // ---- subcommands ----
@@ -346,7 +413,7 @@ Flags:
 	cfg := mustLoadConfig(profile)
 	tokens := mustGetTokens(cfg)
 	ctx := context.Background()
-	client := appsync.New(cfg.AppSyncEndpoint, cfg.FrontendURL, cfg.AmplifyUserAgent, tokens.IDToken)
+	client := newAuthenticatedClient(cfg, tokens)
 
 	sett, err := settings.Get(ctx, client)
 	checkTransportErr(err)
@@ -362,14 +429,35 @@ Flags:
 
 	if up.Policy == nil {
 		// Direct-grant user: no group-based policy.
+		if !looksLikeRawIDs(accountID, roleID) {
+			resolvedAccountID, resolvedAccountName, resolvedRoleID, resolvedRoleName, rtErr := resolveDirectGrantFromRealtime(
+				ctx, client, tokens.UserID, tokens.GroupIDs, accountID, roleID,
+			)
+			if rtErr != nil {
+				var unauth *appsync.UnauthorizedError
+				switch {
+				case errors.Is(rtErr, context.DeadlineExceeded):
+					fmt.Fprintln(os.Stderr, "Debug: entitlement autodiscovery timed out, using manual fallback")
+				case errors.As(rtErr, &unauth):
+					fmt.Fprintf(os.Stderr, "Debug: entitlement autodiscovery unauthorized, using manual fallback: %v\n", rtErr)
+				default:
+					fmt.Fprintf(os.Stderr, "Debug: entitlement autodiscovery failed, using manual fallback: %v\n", rtErr)
+				}
+			} else {
+				accountID, accountName, roleID, roleName = resolvedAccountID, resolvedAccountName, resolvedRoleID, resolvedRoleName
+			}
+		}
+
 		if accountID == "" {
 			accountID = mustPromptLine("Enter AWS account ID: ")
 		}
-		label := mustPromptLine(fmt.Sprintf("Account display name [%s]: ", accountID))
-		if label == "" {
-			accountName = accountID
-		} else {
-			accountName = label
+		if accountName == "" {
+			label := mustPromptLine(fmt.Sprintf("Account display name [%s]: ", accountID))
+			if label == "" {
+				accountName = accountID
+			} else {
+				accountName = label
+			}
 		}
 
 		// Fetch permission sets from getMgmtPermissions; fall back to manual entry.
@@ -385,13 +473,13 @@ Flags:
 			}
 		} else {
 			// --role flag provided: try to match against mgmtPerms list.
-			if len(mgmtPerms) > 0 {
+			if roleName == "" && len(mgmtPerms) > 0 {
 				if id, name, ok := resolveByIDOrName(mgmtPerms, roleID, permissionKey); ok {
 					roleID, roleName = id, name
 				} else {
 					roleName = roleID
 				}
-			} else {
+			} else if roleName == "" {
 				roleName = roleID
 			}
 		}
@@ -533,6 +621,117 @@ Flags:
 	fmt.Printf("View requests: %s/requests\n", cfg.FrontendURL)
 }
 
+type optionsResult struct {
+	PolicyType  string             `json:"policy_type"`
+	Accounts    []policy.Account   `json:"accounts"`
+	Permissions []policy.Permission `json:"permissions"`
+}
+
+func runOptions(profile string, args []string) {
+	fs := flag.NewFlagSet("options", flag.ContinueOnError)
+	var jsonOut = fs.Bool("json", false, "Output JSON")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, `Usage: awsup options [flags]
+
+Show accounts and permission sets available for 'awsup request'.
+
+Flags:
+  --json   Output JSON`)
+	}
+	parseSubcmdFlags(fs, args)
+
+	cfg := mustLoadConfig(profile)
+	tokens := mustGetTokens(cfg)
+	ctx := context.Background()
+	client := newAuthenticatedClient(cfg, tokens)
+
+	up, err := policy.Get(ctx, client, tokens.UserID, tokens.GroupIDs)
+	checkTransportErr(err)
+
+	result := optionsResult{
+		Accounts:    []policy.Account{},
+		Permissions: []policy.Permission{},
+	}
+
+	if up.Policy != nil {
+		result.PolicyType = "group_policy"
+		result.Accounts = up.Policy.Accounts
+		result.Permissions = up.Policy.Permissions
+	} else {
+		result.PolicyType = "direct_grant"
+		perms, err := policy.GetMgmtPermissions(ctx, client)
+		checkTransportErr(err)
+		if len(perms) > 0 {
+			result.Permissions = perms
+		}
+		rtCtx, cancel := context.WithTimeout(ctx, realtimeEntitlementTimeout)
+		defer cancel()
+		rtPolicy, rtErr := getRealtimeEntitlements(rtCtx, client, tokens.UserID, tokens.GroupIDs)
+		if rtErr != nil {
+			fmt.Fprintf(os.Stderr, "Debug: realtime entitlements: %v\n", rtErr)
+		} else if rtPolicy != nil {
+			result.Accounts = rtPolicy.Accounts
+			// Merge realtime permission display names into the mgmt ARN list by ID.
+			// Realtime entries enrich mgmt (which may have ARN-only names); entries
+			// not present in mgmt are appended.
+			if len(rtPolicy.Permissions) > 0 {
+				rtByID := make(map[string]policy.Permission, len(rtPolicy.Permissions))
+				for _, rp := range rtPolicy.Permissions {
+					rtByID[rp.ID] = rp
+				}
+				seen := make(map[string]bool)
+				merged := make([]policy.Permission, 0, len(result.Permissions))
+				for _, m := range result.Permissions {
+					if rp, ok := rtByID[m.ID]; ok {
+						merged = append(merged, rp)
+					} else {
+						merged = append(merged, m)
+					}
+					seen[m.ID] = true
+				}
+				for _, rp := range rtPolicy.Permissions {
+					if !seen[rp.ID] {
+						merged = append(merged, rp)
+					}
+				}
+				result.Permissions = merged
+			}
+		}
+	}
+
+	if *jsonOut {
+		printJSON(result)
+		return
+	}
+
+	fmt.Printf("Policy type: %s\n\n", result.PolicyType)
+	if len(result.Accounts) == 0 {
+		fmt.Println("Accounts: (not discoverable — provide --account <id> to request)")
+	} else {
+		fmt.Println("Accounts:")
+		for _, a := range result.Accounts {
+			if a.Name != "" && a.Name != a.ID {
+				fmt.Printf("  %s (%s)\n", a.Name, a.ID)
+			} else {
+				fmt.Printf("  %s\n", a.ID)
+			}
+		}
+	}
+	fmt.Println()
+	if len(result.Permissions) == 0 {
+		fmt.Println("Permission sets: (none found)")
+	} else {
+		fmt.Println("Permission sets:")
+		for _, p := range result.Permissions {
+			if p.Name != "" && p.Name != p.ID {
+				fmt.Printf("  %s (%s)\n", p.Name, p.ID)
+			} else {
+				fmt.Printf("  %s\n", p.ID)
+			}
+		}
+	}
+}
+
 func runList(profile string, args []string) {
 	fs := flag.NewFlagSet("list", flag.ContinueOnError)
 	var (
@@ -553,7 +752,7 @@ Flags:
 	cfg := mustLoadConfig(profile)
 	tokens := mustGetTokens(cfg)
 	ctx := context.Background()
-	client := appsync.New(cfg.AppSyncEndpoint, cfg.FrontendURL, cfg.AmplifyUserAgent, tokens.IDToken)
+	client := newAuthenticatedClient(cfg, tokens)
 
 	var all []requestRecord
 	var nextToken *string
@@ -635,7 +834,7 @@ Flags:
 	cfg := mustLoadConfig(profile)
 	tokens := mustGetTokens(cfg)
 	ctx := context.Background()
-	client := appsync.New(cfg.AppSyncEndpoint, cfg.FrontendURL, cfg.AmplifyUserAgent, tokens.IDToken)
+	client := newAuthenticatedClient(cfg, tokens)
 
 	sett, err := settings.Get(ctx, client)
 	checkTransportErr(err)
@@ -861,6 +1060,8 @@ func main() {
 		runInit(profile, subargs)
 	case "request":
 		runRequest(profile, subargs)
+	case "options":
+		runOptions(profile, subargs)
 	case "list":
 		runList(profile, subargs)
 	case "settings":

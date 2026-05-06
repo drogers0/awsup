@@ -37,11 +37,34 @@ func (e *NetworkError) Unwrap() error { return e.Err }
 
 // Client sends GraphQL requests to AppSync authenticated by a JWT.
 type Client struct {
-	endpoint  string
-	origin    string
-	userAgent string
-	idToken   string
-	http      *http.Client
+	endpoint    string
+	origin      string
+	userAgent   string
+	idToken     string
+	accessToken string
+	http        *http.Client
+}
+
+// Endpoint returns the configured AppSync GraphQL endpoint.
+func (c *Client) Endpoint() string { return c.endpoint }
+
+// IDToken returns the JWT used for AppSync authorization.
+func (c *Client) IDToken() string { return c.idToken }
+
+// UserAgent returns the Amplify user-agent string sent with AppSync requests.
+func (c *Client) UserAgent() string { return c.userAgent }
+
+// SetAccessToken stores the Cognito access token used for realtime WebSocket
+// subscriptions (AppSync realtime requires the access token, not the ID token).
+func (c *Client) SetAccessToken(t string) { c.accessToken = t }
+
+// RealtimeToken returns the token for WebSocket auth: the access token when
+// available, falling back to the ID token.
+func (c *Client) RealtimeToken() string {
+	if c.accessToken != "" {
+		return c.accessToken
+	}
+	return c.idToken
 }
 
 // New creates a Client. origin is TEAM_FRONTEND_URL (used for Origin/Referer headers).

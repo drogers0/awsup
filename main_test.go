@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/drogers0/awsup/internal/appsync"
 	"github.com/drogers0/awsup/internal/policy"
 	"github.com/drogers0/awsup/internal/tokencache"
 )
@@ -37,6 +40,24 @@ func TestMain(m *testing.M) {
 
 func runBin(args ...string) (stdout, stderr string, exitCode int) {
 	return runBinEnv(nil, args...)
+}
+
+func runBinEnvInput(extraEnv []string, stdin string, args ...string) (stdout, stderr string, exitCode int) {
+	cmd := exec.Command(binPath, args...)
+	cmd.Env = append(os.Environ(), extraEnv...)
+	cmd.Stdin = strings.NewReader(stdin)
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	err := cmd.Run()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+	return outBuf.String(), errBuf.String(), exitCode
 }
 
 // runBinEnv runs the test binary with extra environment overrides appended
@@ -159,6 +180,172 @@ func TestResolveByIDOrName_EmptyList(t *testing.T) {
 	}
 }
 
+func TestApplyRealtimeDirectGrantChoices_FullPayload(t *testing.T) {
+	ent := &policy.Policy{
+		Accounts:    []policy.Account{{ID: "123456789012", Name: "Prod"}},
+		Permissions: []policy.Permission{{ID: "arn:perm", Name: "ReadOnly"}},
+	}
+	acctID, acctName, roleID, roleName := applyRealtimeDirectGrantChoices("", "", ent)
+	if acctID != "123456789012" || acctName != "Prod" {
+		t.Fatalf("unexpected account resolution: %s %s", acctID, acctName)
+	}
+	if roleID != "arn:perm" || roleName != "ReadOnly" {
+		t.Fatalf("unexpected role resolution: %s %s", roleID, roleName)
+	}
+}
+
+func TestApplyRealtimeDirectGrantChoices_PartialPayload(t *testing.T) {
+	ent := &policy.Policy{Accounts: []policy.Account{{ID: "123456789012", Name: "Prod"}}}
+	acctID, acctName, roleID, roleName := applyRealtimeDirectGrantChoices("", "", ent)
+	if acctID != "123456789012" || acctName != "Prod" {
+		t.Fatalf("unexpected account resolution: %s %s", acctID, acctName)
+	}
+	if roleID != "" || roleName != "" {
+		t.Fatalf("expected missing role for partial payload, got %s %s", roleID, roleName)
+	}
+}
+
+func TestApplyRealtimeDirectGrantChoices_PreservesProvidedFlags(t *testing.T) {
+	ent := &policy.Policy{
+		Accounts:    []policy.Account{{ID: "123456789012", Name: "Prod"}},
+		Permissions: []policy.Permission{{ID: "arn:perm", Name: "ReadOnly"}},
+	}
+	acctID, acctName, roleID, roleName := applyRealtimeDirectGrantChoices("Prod", "ReadOnly", ent)
+	if acctID != "123456789012" || roleID != "arn:perm" {
+		t.Fatalf("expected provided names to resolve to IDs, got %s %s", acctID, roleID)
+	}
+	if acctName != "Prod" || roleName != "ReadOnly" {
+		t.Fatalf("expected resolved display names, got %s %s", acctName, roleName)
+	}
+}
+
+func TestResolveDirectGrantFromRealtime_SkipsWhenFlagsComplete(t *testing.T) {
+	orig := getRealtimeEntitlements
+	defer func() { getRealtimeEntitlements = orig }()
+	called := false
+	getRealtimeEntitlements = func(ctx context.Context, c *appsync.Client, userID string, groupIDs []string) (*policy.Policy, error) {
+		called = true
+		return nil, nil
+	}
+	acctID, _, roleID, _, err := resolveDirectGrantFromRealtime(context.Background(), nil, "u1", nil, "123456789012", "arn:role")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if called {
+		t.Fatal("expected realtime lookup to be skipped")
+	}
+	if acctID != "123456789012" || roleID != "arn:role" {
+		t.Fatalf("unexpected IDs: %s %s", acctID, roleID)
+	}
+}
+
+func TestResolveDirectGrantFromRealtime_PartialResult(t *testing.T) {
+	orig := getRealtimeEntitlements
+	defer func() { getRealtimeEntitlements = orig }()
+	getRealtimeEntitlements = func(ctx context.Context, c *appsync.Client, userID string, groupIDs []string) (*policy.Policy, error) {
+		return &policy.Policy{Accounts: []policy.Account{{ID: "123", Name: "Prod"}}}, nil
+	}
+	acctID, acctName, roleID, roleName, err := resolveDirectGrantFromRealtime(context.Background(), nil, "u1", nil, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if acctID != "123" || acctName != "Prod" {
+		t.Fatalf("unexpected account result: %s %s", acctID, acctName)
+	}
+	if roleID != "" || roleName != "" {
+		t.Fatalf("expected unresolved role for partial result, got %s %s", roleID, roleName)
+	}
+}
+
+func TestResolveDirectGrantFromRealtime_TimeoutError(t *testing.T) {
+	orig := getRealtimeEntitlements
+	defer func() { getRealtimeEntitlements = orig }()
+	getRealtimeEntitlements = func(ctx context.Context, c *appsync.Client, userID string, groupIDs []string) (*policy.Policy, error) {
+		return nil, context.DeadlineExceeded
+	}
+	acctID, _, roleID, _, err := resolveDirectGrantFromRealtime(context.Background(), nil, "u1", nil, "", "")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected timeout error, got %v", err)
+	}
+	if acctID != "" || roleID != "" {
+		t.Fatalf("expected unresolved fields on timeout, got %s %s", acctID, roleID)
+	}
+}
+
+func TestRequestDirectFallback_RealtimeTimeout(t *testing.T) {
+	orig := getRealtimeEntitlements
+	defer func() { getRealtimeEntitlements = orig }()
+	getRealtimeEntitlements = func(ctx context.Context, c *appsync.Client, userID string, groupIDs []string) (*policy.Policy, error) {
+		return nil, context.DeadlineExceeded
+	}
+	acctID, acctName, roleID, roleName, err := resolveDirectGrantFromRealtime(context.Background(), nil, "u1", nil, "", "")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected timeout error, got %v", err)
+	}
+	if acctID != "" || acctName != "" || roleID != "" || roleName != "" {
+		t.Fatalf("expected unresolved fields on timeout, got %q %q %q %q", acctID, acctName, roleID, roleName)
+	}
+}
+
+func TestRequestDirectFallback_PartialRealtimeResolve(t *testing.T) {
+	orig := getRealtimeEntitlements
+	defer func() { getRealtimeEntitlements = orig }()
+	getRealtimeEntitlements = func(ctx context.Context, c *appsync.Client, userID string, groupIDs []string) (*policy.Policy, error) {
+		return &policy.Policy{Permissions: []policy.Permission{{ID: "arn:perm", Name: "ReadOnly"}}}, nil
+	}
+	acctID, acctName, roleID, roleName, err := resolveDirectGrantFromRealtime(context.Background(), nil, "u1", nil, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if acctID != "" || acctName != "" {
+		t.Fatalf("expected account unresolved for partial realtime data, got %q %q", acctID, acctName)
+	}
+	if roleID != "arn:perm" || roleName != "ReadOnly" {
+		t.Fatalf("expected role from realtime data, got %q %q", roleID, roleName)
+	}
+}
+
+func TestRequestDirectFallback_RealtimeSuccessFullResolution(t *testing.T) {
+	orig := getRealtimeEntitlements
+	defer func() { getRealtimeEntitlements = orig }()
+	getRealtimeEntitlements = func(ctx context.Context, c *appsync.Client, userID string, groupIDs []string) (*policy.Policy, error) {
+		return &policy.Policy{
+			Accounts:    []policy.Account{{ID: "123", Name: "Prod"}},
+			Permissions: []policy.Permission{{ID: "arn:perm", Name: "ReadOnly"}},
+		}, nil
+	}
+	acctID, acctName, roleID, roleName, err := resolveDirectGrantFromRealtime(context.Background(), nil, "u1", nil, "", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if acctID != "123" || acctName != "Prod" || roleID != "arn:perm" || roleName != "ReadOnly" {
+		t.Fatalf("unexpected full realtime resolution: %q %q %q %q", acctID, acctName, roleID, roleName)
+	}
+}
+
+func TestLooksLikeRawIDs(t *testing.T) {
+	cases := []struct {
+		accountID, roleID string
+		want              bool
+	}{
+		{"123456789012", "arn:aws:sso:::permissionSet/ssoins-abc/ps-xyz", true},
+		{"123456789012", "arn:", true},
+		{"123456789012", "VU_PowerUserAccess", false},
+		{"123456789012", "", false},
+		{"12345678901", "arn:role", false},  // 11 digits
+		{"1234567890123", "arn:role", false}, // 13 digits
+		{"", "arn:role", false},
+		{"123456789abc", "arn:role", false}, // non-numeric
+		{"", "", false},
+	}
+	for _, c := range cases {
+		got := looksLikeRawIDs(c.accountID, c.roleID)
+		if got != c.want {
+			t.Errorf("looksLikeRawIDs(%q, %q) = %v, want %v", c.accountID, c.roleID, got, c.want)
+		}
+	}
+}
+
 func TestFormatChoices(t *testing.T) {
 	accounts := []policy.Account{
 		{Name: "Production", ID: "123456789012"},
@@ -191,6 +378,7 @@ type requestServer struct {
 	mu           sync.Mutex
 	bodies       []string
 	createdInput map[string]any
+	mgmtCalled   bool
 }
 
 func newRequestServer(t *testing.T, accountID, accountName, roleID, roleName string) *requestServer {
@@ -232,6 +420,71 @@ func newRequestServer(t *testing.T, accountID, accountName, roleID, roleName str
 						"permissions": []map[string]any{{"id": roleID, "name": roleName}},
 					},
 				},
+			}})
+		case strings.Contains(req.Query, "ValidateRequest"):
+			json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"validateRequest": map[string]any{"valid": true, "reason": ""},
+			}})
+		case strings.Contains(req.Query, "CreateRequests"):
+			input, _ := req.Variables["input"].(map[string]any)
+			rs.mu.Lock()
+			rs.createdInput = input
+			rs.mu.Unlock()
+			json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"createRequests": map[string]any{
+					"id": "req-1", "status": "pending",
+					"accountId": input["accountId"], "accountName": input["accountName"],
+					"role": input["role"], "roleId": input["roleId"],
+				},
+			}})
+		default:
+			http.Error(w, "unknown query: "+req.Query, 400)
+		}
+	}))
+	t.Cleanup(rs.srv.Close)
+	return rs
+}
+
+func newDirectGrantServer(t *testing.T) *requestServer {
+	t.Helper()
+	rs := &requestServer{}
+	rs.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		rs.mu.Lock()
+		rs.bodies = append(rs.bodies, string(body))
+		rs.mu.Unlock()
+
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(req.Query, "GetSettings"):
+			json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"getSettings": map[string]any{
+					"id": "settings", "duration": "8", "expiry": "30",
+					"comments": false, "ticketNo": false, "approval": false,
+				},
+			}})
+		case strings.Contains(req.Query, "GetUserPolicy"):
+			json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"getUserPolicy": map[string]any{"id": "u1", "username": "user@example.com", "policy": nil},
+			}})
+		case strings.Contains(req.Query, "GetMgmtPermissions"):
+			rs.mu.Lock()
+			rs.mgmtCalled = true
+			rs.mu.Unlock()
+			json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"getMgmtPermissions": map[string]any{"permissions": []string{"arn:aws:sso:::permissionSet/ssoins/ps-abc"}},
 			}})
 		case strings.Contains(req.Query, "ValidateRequest"):
 			json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
@@ -393,5 +646,58 @@ func TestRequest_PolicyFetched_WhenAllFlagsProvided(t *testing.T) {
 	}
 	if !rs.sawOperation("GetUserPolicy") {
 		t.Error("expected getUserPolicy operation to be invoked even when all flags are provided")
+	}
+}
+
+func TestRequestDirectFallback_RealtimeUnavailable_ManualFallback(t *testing.T) {
+	home := t.TempDir()
+	rs := newDirectGrantServer(t)
+	env := setupRequestEnv(t, home, rs.srv.URL, "test-client", "us-east-1_pool")
+
+	stdout, stderr, code := runBinEnvInput(env, "\n",
+		"request",
+		"--account", "123456789012",
+		"--duration", "4",
+		"--justification", "x",
+		"--yes",
+	)
+	if code != 0 {
+		t.Fatalf("exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "entitlement autodiscovery failed") {
+		t.Fatalf("expected realtime attempt debug log, got stderr: %s", stderr)
+	}
+
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if !rs.mgmtCalled {
+		t.Fatal("expected getMgmtPermissions fallback to be called")
+	}
+	if rs.createdInput == nil {
+		t.Fatal("expected createRequests to be called")
+	}
+	if got := rs.createdInput["roleId"]; got != "arn:aws:sso:::permissionSet/ssoins/ps-abc" {
+		t.Fatalf("unexpected roleId from fallback: %v", got)
+	}
+}
+
+func TestRequestDirectFallback_FlagsCompleteSkipsRealtime(t *testing.T) {
+	home := t.TempDir()
+	rs := newDirectGrantServer(t)
+	env := setupRequestEnv(t, home, rs.srv.URL, "test-client", "us-east-1_pool")
+
+	stdout, stderr, code := runBinEnvInput(env, "\n",
+		"request",
+		"--account", "123456789012",
+		"--role", "arn:aws:sso:::permissionSet/ssoins/ps-abc",
+		"--duration", "4",
+		"--justification", "x",
+		"--yes",
+	)
+	if code != 0 {
+		t.Fatalf("exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if strings.Contains(stderr, "entitlement autodiscovery") {
+		t.Fatalf("expected realtime to be skipped when flags complete, got stderr: %s", stderr)
 	}
 }

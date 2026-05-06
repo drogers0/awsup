@@ -3,12 +3,15 @@ package policy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/drogers0/awsup/internal/appsync"
+	"github.com/gorilla/websocket"
 )
 
 func newTestClient(srv *httptest.Server) *appsync.Client {
@@ -119,5 +122,268 @@ func TestGet_GraphQLError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not authorized to view policy") {
 		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func mustRaw(t *testing.T, v any) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func withTestDialer(t *testing.T, wsURL string) {
+	t.Helper()
+	orig := wsDialContext
+	wsDialContext = func(ctx context.Context, _ string, _ []string) (*websocket.Conn, *http.Response, error) {
+		dialer := websocket.Dialer{Subprotocols: []string{"graphql-ws"}}
+		return dialer.DialContext(ctx, wsURL, nil)
+	}
+	t.Cleanup(func() { wsDialContext = orig })
+}
+
+func newRealtimeServer(t *testing.T, h func(*websocket.Conn)) *httptest.Server {
+	t.Helper()
+	upgrader := websocket.Upgrader{Subprotocols: []string{"graphql-ws"}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade failed: %v", err)
+		}
+		defer conn.Close()
+		h(conn)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func realtimeClient() *appsync.Client {
+	return appsync.New("https://abc123.appsync-api.us-east-1.amazonaws.com/graphql", "https://example.com", "ua", "token")
+}
+
+func TestGetOnPublishPolicyEntitlements_Success(t *testing.T) {
+	srv := newRealtimeServer(t, func(conn *websocket.Conn) {
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteJSON(wsMessage{Type: "connection_ack"})
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteJSON(wsMessage{ID: "1", Type: "data", Payload: mustRaw(t, map[string]any{
+			"data": map[string]any{
+				"onPublishPolicy": map[string]any{
+					"id": "p1", "username": "u@test.com",
+					"policy": []map[string]any{{
+						"accounts":    []map[string]any{{"id": "123", "name": "Prod"}},
+						"permissions": []map[string]any{{"id": "arn:perm", "name": "ReadOnly"}},
+					}},
+				},
+			},
+		})})
+	})
+	withTestDialer(t, "ws"+strings.TrimPrefix(srv.URL, "http"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	p, err := GetOnPublishPolicyEntitlements(ctx, realtimeClient(), "u1", []string{"g1"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(p.Accounts) != 1 || len(p.Permissions) != 1 {
+		t.Fatalf("unexpected payload: %+v", p)
+	}
+}
+
+func TestGetOnPublishPolicyEntitlements_Partial(t *testing.T) {
+	srv := newRealtimeServer(t, func(conn *websocket.Conn) {
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteJSON(wsMessage{Type: "connection_ack"})
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteJSON(wsMessage{ID: "1", Type: "data", Payload: mustRaw(t, map[string]any{
+			"data": map[string]any{
+				"onPublishPolicy": map[string]any{
+					"id": "p1", "username": "u@test.com",
+					"policy": []map[string]any{{
+						"accounts": []map[string]any{{"id": "123", "name": "Prod"}},
+					}},
+				},
+			},
+		})})
+	})
+	withTestDialer(t, "ws"+strings.TrimPrefix(srv.URL, "http"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	p, err := GetOnPublishPolicyEntitlements(ctx, realtimeClient(), "u1", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(p.Accounts) != 1 {
+		t.Fatalf("expected account from partial payload")
+	}
+	if p.Permissions == nil || len(p.Permissions) != 0 {
+		t.Fatalf("expected empty permission slice, got %+v", p.Permissions)
+	}
+}
+
+func TestGetOnPublishPolicyEntitlements_PartialPermissionsOnly(t *testing.T) {
+	srv := newRealtimeServer(t, func(conn *websocket.Conn) {
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteJSON(wsMessage{Type: "connection_ack"})
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteJSON(wsMessage{ID: "1", Type: "data", Payload: mustRaw(t, map[string]any{
+			"data": map[string]any{
+				"onPublishPolicy": map[string]any{
+					"id": "p1", "username": "u@test.com",
+					"policy": []map[string]any{{
+						"permissions": []map[string]any{{"id": "arn:perm", "name": "ReadOnly"}},
+					}},
+				},
+			},
+		})})
+	})
+	withTestDialer(t, "ws"+strings.TrimPrefix(srv.URL, "http"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	p, err := GetOnPublishPolicyEntitlements(ctx, realtimeClient(), "u1", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p.Accounts == nil || len(p.Accounts) != 0 {
+		t.Fatalf("expected empty accounts slice, got %+v", p.Accounts)
+	}
+	if len(p.Permissions) != 1 {
+		t.Fatalf("expected permissions from partial payload, got %+v", p.Permissions)
+	}
+}
+
+func TestGetOnPublishPolicyEntitlements_EmptyThenUsable(t *testing.T) {
+	srv := newRealtimeServer(t, func(conn *websocket.Conn) {
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteJSON(wsMessage{Type: "connection_ack"})
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteJSON(wsMessage{ID: "1", Type: "data", Payload: mustRaw(t, map[string]any{
+			"data": map[string]any{"onPublishPolicy": map[string]any{
+				"id": "p1", "username": "u@test.com",
+				"policy": []map[string]any{{"accounts": []any{}, "permissions": []any{}}},
+			}},
+		})})
+		_ = conn.WriteJSON(wsMessage{ID: "1", Type: "data", Payload: mustRaw(t, map[string]any{
+			"data": map[string]any{"onPublishPolicy": map[string]any{
+				"id": "p1", "username": "u@test.com",
+				"policy": []map[string]any{{"permissions": []map[string]any{{"id": "arn:perm", "name": "ReadOnly"}}}},
+			}},
+		})})
+	})
+	withTestDialer(t, "ws"+strings.TrimPrefix(srv.URL, "http"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	p, err := GetOnPublishPolicyEntitlements(ctx, realtimeClient(), "u1", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(p.Permissions) != 1 {
+		t.Fatalf("expected second usable frame, got %+v", p)
+	}
+}
+
+func TestGetOnPublishPolicyEntitlements_Timeout(t *testing.T) {
+	srv := newRealtimeServer(t, func(conn *websocket.Conn) {
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteJSON(wsMessage{Type: "connection_ack"})
+		_, _, _ = conn.ReadMessage()
+		for {
+			_ = conn.WriteJSON(wsMessage{Type: "ka"})
+			time.Sleep(50 * time.Millisecond)
+		}
+	})
+	withTestDialer(t, "ws"+strings.TrimPrefix(srv.URL, "http"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	_, err := GetOnPublishPolicyEntitlements(ctx, realtimeClient(), "u1", nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded, got %v", err)
+	}
+}
+
+func TestGetOnPublishPolicyEntitlements_Unauthorized(t *testing.T) {
+	srv := newRealtimeServer(t, func(conn *websocket.Conn) {
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteJSON(wsMessage{Type: "connection_error", Payload: mustRaw(t, map[string]any{"message": "unauthorized"})})
+	})
+	withTestDialer(t, "ws"+strings.TrimPrefix(srv.URL, "http"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := GetOnPublishPolicyEntitlements(ctx, realtimeClient(), "u1", nil)
+	var unauth *appsync.UnauthorizedError
+	if !errors.As(err, &unauth) {
+		t.Fatalf("expected unauthorized error, got %v", err)
+	}
+}
+
+func TestGetOnPublishPolicyEntitlements_SubscriptionError(t *testing.T) {
+	srv := newRealtimeServer(t, func(conn *websocket.Conn) {
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteJSON(wsMessage{Type: "connection_ack"})
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteJSON(wsMessage{Type: "error", Payload: mustRaw(t, map[string]any{"message": "subscription failed"})})
+	})
+	withTestDialer(t, "ws"+strings.TrimPrefix(srv.URL, "http"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := GetOnPublishPolicyEntitlements(ctx, realtimeClient(), "u1", nil)
+	if err == nil || !strings.Contains(err.Error(), "subscription error") {
+		t.Fatalf("expected subscription error, got %v", err)
+	}
+}
+
+func TestGetOnPublishPolicyEntitlements_CompleteWithoutData(t *testing.T) {
+	srv := newRealtimeServer(t, func(conn *websocket.Conn) {
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteJSON(wsMessage{Type: "connection_ack"})
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteJSON(wsMessage{ID: "1", Type: "complete"})
+	})
+	withTestDialer(t, "ws"+strings.TrimPrefix(srv.URL, "http"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := GetOnPublishPolicyEntitlements(ctx, realtimeClient(), "u1", nil)
+	var netErr *appsync.NetworkError
+	if !errors.As(err, &netErr) {
+		t.Fatalf("expected network error for complete without data, got %v", err)
+	}
+}
+
+func TestGetOnPublishPolicyEntitlements_MalformedPayload(t *testing.T) {
+	srv := newRealtimeServer(t, func(conn *websocket.Conn) {
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteJSON(wsMessage{Type: "connection_ack"})
+		_, _, _ = conn.ReadMessage()
+		_ = conn.WriteJSON(wsMessage{Type: "data", Payload: json.RawMessage(`{"data":`)})
+	})
+	withTestDialer(t, "ws"+strings.TrimPrefix(srv.URL, "http"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := GetOnPublishPolicyEntitlements(ctx, realtimeClient(), "u1", nil)
+	var netErr *appsync.NetworkError
+	if !errors.As(err, &netErr) {
+		t.Fatalf("expected network error, got %v", err)
+	}
+}
+
+func TestGetOnPublishPolicyEntitlements_InvalidEndpoint(t *testing.T) {
+	client := appsync.New("http://localhost/graphql", "https://example.com", "ua", "token")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := GetOnPublishPolicyEntitlements(ctx, client, "u1", nil)
+	var netErr *appsync.NetworkError
+	if !errors.As(err, &netErr) {
+		t.Fatalf("expected network error, got %v", err)
 	}
 }

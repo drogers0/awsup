@@ -161,7 +161,7 @@ The `AWSUP_PROFILE` environment variable is also respected as a default profile 
 
 - **Session expired**: Re-sign into TEAM in your browser, then retry. The CLI will re-read the fresh token automatically.
 
-- **No eligible accounts shown (null policy)**: You have direct account grants rather than group-based entitlements. Enter your account ID and role ARN manually when prompted, or use `--account` and `--role` flags.
+- **No eligible accounts shown (null policy)**: You may have direct account grants rather than group-based entitlements. The CLI first attempts realtime entitlement autodiscovery (7-second timeout), then falls back to manual entry when data is unavailable. Timeout fallback does not block request submission. You can always provide `--account` and `--role` flags directly.
 
 - **Requests list is empty or wrong case**: The list query is case-sensitive on the email address. Ensure the email in your TEAM account matches exactly.
 

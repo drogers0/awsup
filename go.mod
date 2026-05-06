@@ -2,7 +2,10 @@ module github.com/drogers0/awsup
 
 go 1.24.0
 
-require github.com/noperator/chromedb v0.0.0-20250507184410-ea058a105818
+require (
+	github.com/gorilla/websocket v1.5.3
+	github.com/noperator/chromedb v0.0.0-20250507184410-ea058a105818
+)
 
 require (
 	github.com/golang/snappy v0.0.0-20180518054509-2e65f85255db // indirect
