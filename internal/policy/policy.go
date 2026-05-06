@@ -111,7 +111,7 @@ type subscriptionExtensions struct {
 }
 
 type subscriptionStartPayload struct {
-	Data       string                `json:"data"`
+	Data       string                 `json:"data"`
 	Extensions subscriptionExtensions `json:"extensions"`
 }
 

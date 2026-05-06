@@ -205,9 +205,11 @@ func checkTransportErr(err error) {
 // stdinReader is shared across all prompt calls. A per-call bufio.Reader
 // would over-read the pipe and discard buffered bytes belonging to the next
 // prompt — fatal for piped multi-line input.
+// Tests replace this; callers must not use t.Parallel() — package-level mutation.
 var stdinReader = bufio.NewReader(os.Stdin)
 
 // getRealtimeEntitlements is replaceable in tests to avoid live realtime connections.
+// Tests replace this; callers must not use t.Parallel() — package-level mutation.
 var getRealtimeEntitlements = policy.GetOnPublishPolicyEntitlements
 
 // promptLine reads a line from stdin and reports whether stdin was open.
@@ -365,23 +367,66 @@ func looksLikeRawIDs(accountID, roleID string) bool {
 	return strings.HasPrefix(roleID, "arn:")
 }
 
-func resolveDirectGrantFromRealtime(ctx context.Context, client *appsync.Client, userID string, groupIDs []string, accountID, roleID string) (string, string, string, string, error) {
-	// Defensive fast-path: callers should use looksLikeRawIDs before calling,
-	// but guard here too so the function is safe to call standalone.
-	if looksLikeRawIDs(accountID, roleID) {
-		return accountID, "", roleID, "", nil
+type realtimeResult struct {
+	policy *policy.Policy
+	err    error
+}
+
+// startRealtimeSubscription launches GetOnPublishPolicyEntitlements in a
+// background goroutine using rtCtx (which the caller must cancel when done).
+// The returned channel is buffered (size 1) so the goroutine never blocks on
+// send, even if the caller cancels without consuming the result.
+func startRealtimeSubscription(rtCtx context.Context, client *appsync.Client, userID string, groupIDs []string) <-chan realtimeResult {
+	ch := make(chan realtimeResult, 1)
+	go func() {
+		p, err := getRealtimeEntitlements(rtCtx, client, userID, groupIDs)
+		ch <- realtimeResult{policy: p, err: err}
+	}()
+	return ch
+}
+
+// Sentinel errors returned by requestOrchestrator. The wrapper inspects these
+// to map back to today's exit codes (0 for cancel, 2 for invalid request) and
+// to suppress double-printing — the orchestrator itself prints the
+// user-visible message before returning a sentinel.
+var (
+	errUserCancelled   = errors.New("user cancelled at confirmation")
+	errRequestNotValid = errors.New("request rejected by validateRequest")
+)
+
+// exitCodeFor maps an orchestrator return error to the process exit code,
+// preserving today's checkTransportErr semantics (3=unauthorized, 4=network,
+// 2=invalid request, 0=cancelled, 1=everything else).
+func exitCodeFor(err error) int {
+	switch {
+	case err == nil, errors.Is(err, errUserCancelled):
+		return 0
+	case errors.Is(err, errRequestNotValid):
+		return 2
 	}
-	rtCtx, cancel := context.WithTimeout(ctx, realtimeEntitlementTimeout)
-	defer cancel()
-	rtPolicy, err := getRealtimeEntitlements(rtCtx, client, userID, groupIDs)
-	if err != nil {
-		return accountID, "", roleID, "", err
+	var unauth *appsync.UnauthorizedError
+	if errors.As(err, &unauth) {
+		return 3
 	}
-	resolvedAccountID, resolvedAccountName, resolvedRoleID, resolvedRoleName := applyRealtimeDirectGrantChoices(accountID, roleID, rtPolicy)
-	return resolvedAccountID, resolvedAccountName, resolvedRoleID, resolvedRoleName, nil
+	var netErr *appsync.NetworkError
+	if errors.As(err, &netErr) {
+		return 4
+	}
+	return 1
 }
 
 // ---- subcommands ----
+
+type requestFlags struct {
+	accountFlag       string
+	roleFlag          string
+	durationFlag      string
+	justificationFlag string
+	ticketFlag        string
+	startFlag         string
+	yes               bool
+	jsonOut           bool
+}
 
 func runRequest(profile string, args []string) {
 	fs := flag.NewFlagSet("request", flag.ContinueOnError)
@@ -412,39 +457,87 @@ Flags:
 
 	cfg := mustLoadConfig(profile)
 	tokens := mustGetTokens(cfg)
-	ctx := context.Background()
+	flags := requestFlags{
+		accountFlag:       *accountFlag,
+		roleFlag:          *roleFlag,
+		durationFlag:      *durationFlag,
+		justificationFlag: *justificationFlag,
+		ticketFlag:        *ticketFlag,
+		startFlag:         *startFlag,
+		yes:               *yes,
+		jsonOut:           *jsonOut,
+	}
+	err := requestOrchestrator(context.Background(), cfg, tokens, flags)
+
+	// Print branches mirror today's checkTransportErr formats (main.go:193, 198, 201).
+	// Sentinel errors print inside the orchestrator and must NOT be re-printed here.
+	var unauth *appsync.UnauthorizedError
+	var netErr *appsync.NetworkError
+	switch {
+	case err == nil,
+		errors.Is(err, errUserCancelled),
+		errors.Is(err, errRequestNotValid):
+		// already printed (or no error)
+	case errors.As(err, &unauth):
+		fmt.Fprintf(os.Stderr, "Error: unauthorized — %v\n", unauth)
+	case errors.As(err, &netErr):
+		fmt.Fprintf(os.Stderr, "Error: %v\n", netErr)
+	default:
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	}
+	os.Exit(exitCodeFor(err))
+}
+
+// requestOrchestrator runs the body of `awsup request` and returns errors
+// instead of calling os.Exit, so tests can drive it directly. The wrapper
+// (runRequest) maps the returned error to a process exit code via exitCodeFor.
+func requestOrchestrator(ctx context.Context, cfg *config.Config, tokens *tokencache.Cache, flags requestFlags) error {
 	client := newAuthenticatedClient(cfg, tokens)
 
 	sett, err := settings.Get(ctx, client)
-	checkTransportErr(err)
+	if err != nil {
+		return err
+	}
 
-	accountID := *accountFlag
-	roleID := *roleFlag
+	accountID := flags.accountFlag
+	roleID := flags.roleFlag
 	var accountName, roleName string
-	durationStr := *durationFlag
-	justification := *justificationFlag
+	durationStr := flags.durationFlag
+	justification := flags.justificationFlag
+
+	// Launch the realtime WebSocket subscription concurrently with policy.Get
+	// so the WS is subscribed before the backend's onPublishPolicy push fires
+	// (~900ms after getUserPolicy). Group-policy users will land on the cancel
+	// branch below; the WS dial is aborted within milliseconds. When both flags
+	// are raw IDs, we know up-front realtime is not needed and skip the launch.
+	rtCtx, rtCancel := context.WithTimeout(ctx, realtimeEntitlementTimeout)
+	defer rtCancel()
+	var rtCh <-chan realtimeResult
+	if !looksLikeRawIDs(accountID, roleID) {
+		rtCh = startRealtimeSubscription(rtCtx, client, tokens.UserID, tokens.GroupIDs)
+	}
 
 	up, err := policy.Get(ctx, client, tokens.UserID, tokens.GroupIDs)
-	checkTransportErr(err)
+	if err != nil {
+		return err
+	}
 
 	if up.Policy == nil {
 		// Direct-grant user: no group-based policy.
-		if !looksLikeRawIDs(accountID, roleID) {
-			resolvedAccountID, resolvedAccountName, resolvedRoleID, resolvedRoleName, rtErr := resolveDirectGrantFromRealtime(
-				ctx, client, tokens.UserID, tokens.GroupIDs, accountID, roleID,
-			)
-			if rtErr != nil {
+		if rtCh != nil {
+			rt := <-rtCh
+			if rt.err != nil {
 				var unauth *appsync.UnauthorizedError
 				switch {
-				case errors.Is(rtErr, context.DeadlineExceeded):
+				case errors.Is(rt.err, context.DeadlineExceeded):
 					fmt.Fprintln(os.Stderr, "Debug: entitlement autodiscovery timed out, using manual fallback")
-				case errors.As(rtErr, &unauth):
-					fmt.Fprintf(os.Stderr, "Debug: entitlement autodiscovery unauthorized, using manual fallback: %v\n", rtErr)
+				case errors.As(rt.err, &unauth):
+					fmt.Fprintf(os.Stderr, "Debug: entitlement autodiscovery unauthorized, using manual fallback: %v\n", rt.err)
 				default:
-					fmt.Fprintf(os.Stderr, "Debug: entitlement autodiscovery failed, using manual fallback: %v\n", rtErr)
+					fmt.Fprintf(os.Stderr, "Debug: entitlement autodiscovery failed, using manual fallback: %v\n", rt.err)
 				}
 			} else {
-				accountID, accountName, roleID, roleName = resolvedAccountID, resolvedAccountName, resolvedRoleID, resolvedRoleName
+				accountID, accountName, roleID, roleName = applyRealtimeDirectGrantChoices(accountID, roleID, rt.policy)
 			}
 		}
 
@@ -467,14 +560,14 @@ Flags:
 			roleName = roleID
 		}
 	} else {
+		rtCancel() // group-policy user; cancel the (possibly running) subscription
 		if accountID == "" {
 			accountID, accountName = selectFromList("accounts", up.Policy.Accounts, accountKey)
 		} else {
 			id, name, ok := resolveByIDOrName(up.Policy.Accounts, accountID, accountKey)
 			if !ok {
-				fmt.Fprintf(os.Stderr, "Error: account %q not found in your policy. Available: %s\n",
+				return fmt.Errorf("account %q not found in your policy. Available: %s",
 					accountID, formatChoices(up.Policy.Accounts, accountKey))
-				os.Exit(1)
 			}
 			accountID, accountName = id, name
 		}
@@ -483,9 +576,8 @@ Flags:
 		} else {
 			id, name, ok := resolveByIDOrName(up.Policy.Permissions, roleID, permissionKey)
 			if !ok {
-				fmt.Fprintf(os.Stderr, "Error: role %q not found in your policy. Available: %s\n",
+				return fmt.Errorf("role %q not found in your policy. Available: %s",
 					roleID, formatChoices(up.Policy.Permissions, permissionKey))
-				os.Exit(1)
 			}
 			roleID, roleName = id, name
 		}
@@ -508,57 +600,51 @@ Flags:
 	if justification == "" {
 		justification = mustPromptLine("Justification: ")
 		if justification == "" {
-			fmt.Fprintln(os.Stderr, "Error: justification is required")
-			os.Exit(1)
+			return fmt.Errorf("justification is required")
 		}
 	}
 
-	// Validate duration against settings max.
 	reqDur, err := strconv.Atoi(durationStr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: invalid duration %q: must be a whole number\n", durationStr)
-		os.Exit(1)
+		return fmt.Errorf("invalid duration %q: must be a whole number", durationStr)
 	}
 	if sett.Duration != "" {
 		maxDur, parseErr := strconv.Atoi(sett.Duration)
 		if parseErr != nil {
 			fmt.Fprintf(os.Stderr, "Warning: server returned non-numeric max duration %q; skipping enforcement\n", sett.Duration)
 		} else if maxDur > 0 && reqDur > maxDur {
-			fmt.Fprintf(os.Stderr, "Error: requested duration %d hours exceeds maximum %d hours\n", reqDur, maxDur)
-			os.Exit(1)
+			return fmt.Errorf("requested duration %d hours exceeds maximum %d hours", reqDur, maxDur)
 		}
 	}
 
-	// Validate ticket if required.
-	ticket := *ticketFlag
+	ticket := flags.ticketFlag
 	if sett.TicketNo && ticket == "" {
 		ticket = mustPromptLine("Ticket number: ")
 		if ticket == "" {
-			fmt.Fprintln(os.Stderr, "Error: ticket number is required")
-			os.Exit(1)
+			return fmt.Errorf("ticket number is required")
 		}
 	}
 
-	startTime := *startFlag
+	startTime := flags.startFlag
 	if startTime == "" {
 		startTime = time.Now().Format(time.RFC3339)
 	}
 
-	// validateRequest.
 	vData, err := appsync.Execute[validateRequestData](ctx, client, validateRequestMutation, validateRequestVars{
 		AccountID: accountID,
 		RoleID:    roleID,
 		UserID:    tokens.UserID,
 		GroupIDs:  tokens.GroupIDs,
 	})
-	checkTransportErr(err)
+	if err != nil {
+		return err
+	}
 	if vData.ValidateRequest != nil && !vData.ValidateRequest.Valid {
 		fmt.Fprintf(os.Stderr, "Error: request not valid: %s\n", vData.ValidateRequest.Reason)
-		os.Exit(2)
+		return errRequestNotValid
 	}
 
-	// Confirmation.
-	if !*yes {
+	if !flags.yes {
 		fmt.Printf("\nRequest summary:\n")
 		fmt.Printf("  Account:       %s (%s)\n", accountName, accountID)
 		fmt.Printf("  Role:          %s\n", roleName)
@@ -571,11 +657,10 @@ Flags:
 		answer, ok := promptLine("\nSubmit? [y/N] ")
 		if !ok || (!strings.EqualFold(answer, "y") && !strings.EqualFold(answer, "yes")) {
 			fmt.Println("Cancelled.")
-			os.Exit(0)
+			return errUserCancelled
 		}
 	}
 
-	// createRequests.
 	cData, err := appsync.Execute[createRequestsData](ctx, client, createRequestsMutation, createRequestsVars{
 		Input: createRequestsInput{
 			AccountID:     accountID,
@@ -588,25 +673,27 @@ Flags:
 			TicketNo:      ticket,
 		},
 	})
-	checkTransportErr(err)
+	if err != nil {
+		return err
+	}
 
 	rec := cData.CreateRequests
 	if rec == nil {
-		fmt.Fprintln(os.Stderr, "Error: createRequests returned null")
-		os.Exit(1)
+		return fmt.Errorf("createRequests returned null")
 	}
 
-	if *jsonOut {
+	if flags.jsonOut {
 		printJSON(rec)
-		return
+		return nil
 	}
 	fmt.Printf("Request %s submitted — status: %s\n", rec.ID, rec.Status)
 	fmt.Printf("View requests: %s/requests\n", cfg.FrontendURL)
+	return nil
 }
 
 type optionsResult struct {
-	PolicyType  string             `json:"policy_type"`
-	Accounts    []policy.Account   `json:"accounts"`
+	PolicyType  string              `json:"policy_type"`
+	Accounts    []policy.Account    `json:"accounts"`
 	Permissions []policy.Permission `json:"permissions"`
 }
 
@@ -628,6 +715,12 @@ Flags:
 	ctx := context.Background()
 	client := newAuthenticatedClient(cfg, tokens)
 
+	// Launch realtime concurrently with policy.Get (see runRequest comment).
+	// runOptions has no flags to short-circuit on, so it always launches.
+	rtCtx, rtCancel := context.WithTimeout(ctx, realtimeEntitlementTimeout)
+	defer rtCancel()
+	rtCh := startRealtimeSubscription(rtCtx, client, tokens.UserID, tokens.GroupIDs)
+
 	up, err := policy.Get(ctx, client, tokens.UserID, tokens.GroupIDs)
 	checkTransportErr(err)
 
@@ -637,19 +730,18 @@ Flags:
 	}
 
 	if up.Policy != nil {
+		rtCancel()
 		result.PolicyType = "group_policy"
 		result.Accounts = up.Policy.Accounts
 		result.Permissions = up.Policy.Permissions
 	} else {
 		result.PolicyType = "direct_grant"
-		rtCtx, cancel := context.WithTimeout(ctx, realtimeEntitlementTimeout)
-		defer cancel()
-		rtPolicy, rtErr := getRealtimeEntitlements(rtCtx, client, tokens.UserID, tokens.GroupIDs)
-		if rtErr != nil {
-			fmt.Fprintf(os.Stderr, "Debug: realtime entitlements: %v\n", rtErr)
-		} else if rtPolicy != nil {
-			result.Accounts = rtPolicy.Accounts
-			result.Permissions = rtPolicy.Permissions
+		rt := <-rtCh
+		if rt.err != nil {
+			fmt.Fprintf(os.Stderr, "Debug: realtime entitlements: %v\n", rt.err)
+		} else if rt.policy != nil {
+			result.Accounts = rt.policy.Accounts
+			result.Permissions = rt.policy.Permissions
 		}
 	}
 

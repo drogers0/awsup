@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/drogers0/awsup/internal/appsync"
+	"github.com/drogers0/awsup/internal/config"
 	"github.com/drogers0/awsup/internal/policy"
 	"github.com/drogers0/awsup/internal/tokencache"
 )
@@ -219,110 +221,6 @@ func TestApplyRealtimeDirectGrantChoices_PreservesProvidedFlags(t *testing.T) {
 	}
 }
 
-func TestResolveDirectGrantFromRealtime_SkipsWhenFlagsComplete(t *testing.T) {
-	orig := getRealtimeEntitlements
-	defer func() { getRealtimeEntitlements = orig }()
-	called := false
-	getRealtimeEntitlements = func(ctx context.Context, c *appsync.Client, userID string, groupIDs []string) (*policy.Policy, error) {
-		called = true
-		return nil, nil
-	}
-	acctID, _, roleID, _, err := resolveDirectGrantFromRealtime(context.Background(), nil, "u1", nil, "123456789012", "arn:role")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if called {
-		t.Fatal("expected realtime lookup to be skipped")
-	}
-	if acctID != "123456789012" || roleID != "arn:role" {
-		t.Fatalf("unexpected IDs: %s %s", acctID, roleID)
-	}
-}
-
-func TestResolveDirectGrantFromRealtime_PartialResult(t *testing.T) {
-	orig := getRealtimeEntitlements
-	defer func() { getRealtimeEntitlements = orig }()
-	getRealtimeEntitlements = func(ctx context.Context, c *appsync.Client, userID string, groupIDs []string) (*policy.Policy, error) {
-		return &policy.Policy{Accounts: []policy.Account{{ID: "123", Name: "Prod"}}}, nil
-	}
-	acctID, acctName, roleID, roleName, err := resolveDirectGrantFromRealtime(context.Background(), nil, "u1", nil, "", "")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if acctID != "123" || acctName != "Prod" {
-		t.Fatalf("unexpected account result: %s %s", acctID, acctName)
-	}
-	if roleID != "" || roleName != "" {
-		t.Fatalf("expected unresolved role for partial result, got %s %s", roleID, roleName)
-	}
-}
-
-func TestResolveDirectGrantFromRealtime_TimeoutError(t *testing.T) {
-	orig := getRealtimeEntitlements
-	defer func() { getRealtimeEntitlements = orig }()
-	getRealtimeEntitlements = func(ctx context.Context, c *appsync.Client, userID string, groupIDs []string) (*policy.Policy, error) {
-		return nil, context.DeadlineExceeded
-	}
-	acctID, _, roleID, _, err := resolveDirectGrantFromRealtime(context.Background(), nil, "u1", nil, "", "")
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected timeout error, got %v", err)
-	}
-	if acctID != "" || roleID != "" {
-		t.Fatalf("expected unresolved fields on timeout, got %s %s", acctID, roleID)
-	}
-}
-
-func TestRequestDirectFallback_RealtimeTimeout(t *testing.T) {
-	orig := getRealtimeEntitlements
-	defer func() { getRealtimeEntitlements = orig }()
-	getRealtimeEntitlements = func(ctx context.Context, c *appsync.Client, userID string, groupIDs []string) (*policy.Policy, error) {
-		return nil, context.DeadlineExceeded
-	}
-	acctID, acctName, roleID, roleName, err := resolveDirectGrantFromRealtime(context.Background(), nil, "u1", nil, "", "")
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected timeout error, got %v", err)
-	}
-	if acctID != "" || acctName != "" || roleID != "" || roleName != "" {
-		t.Fatalf("expected unresolved fields on timeout, got %q %q %q %q", acctID, acctName, roleID, roleName)
-	}
-}
-
-func TestRequestDirectFallback_PartialRealtimeResolve(t *testing.T) {
-	orig := getRealtimeEntitlements
-	defer func() { getRealtimeEntitlements = orig }()
-	getRealtimeEntitlements = func(ctx context.Context, c *appsync.Client, userID string, groupIDs []string) (*policy.Policy, error) {
-		return &policy.Policy{Permissions: []policy.Permission{{ID: "arn:perm", Name: "ReadOnly"}}}, nil
-	}
-	acctID, acctName, roleID, roleName, err := resolveDirectGrantFromRealtime(context.Background(), nil, "u1", nil, "", "")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if acctID != "" || acctName != "" {
-		t.Fatalf("expected account unresolved for partial realtime data, got %q %q", acctID, acctName)
-	}
-	if roleID != "arn:perm" || roleName != "ReadOnly" {
-		t.Fatalf("expected role from realtime data, got %q %q", roleID, roleName)
-	}
-}
-
-func TestRequestDirectFallback_RealtimeSuccessFullResolution(t *testing.T) {
-	orig := getRealtimeEntitlements
-	defer func() { getRealtimeEntitlements = orig }()
-	getRealtimeEntitlements = func(ctx context.Context, c *appsync.Client, userID string, groupIDs []string) (*policy.Policy, error) {
-		return &policy.Policy{
-			Accounts:    []policy.Account{{ID: "123", Name: "Prod"}},
-			Permissions: []policy.Permission{{ID: "arn:perm", Name: "ReadOnly"}},
-		}, nil
-	}
-	acctID, acctName, roleID, roleName, err := resolveDirectGrantFromRealtime(context.Background(), nil, "u1", nil, "", "")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if acctID != "123" || acctName != "Prod" || roleID != "arn:perm" || roleName != "ReadOnly" {
-		t.Fatalf("unexpected full realtime resolution: %q %q %q %q", acctID, acctName, roleID, roleName)
-	}
-}
-
 func TestLooksLikeRawIDs(t *testing.T) {
 	cases := []struct {
 		accountID, roleID string
@@ -332,7 +230,7 @@ func TestLooksLikeRawIDs(t *testing.T) {
 		{"123456789012", "arn:", true},
 		{"123456789012", "VU_PowerUserAccess", false},
 		{"123456789012", "", false},
-		{"12345678901", "arn:role", false},  // 11 digits
+		{"12345678901", "arn:role", false},   // 11 digits
 		{"1234567890123", "arn:role", false}, // 13 digits
 		{"", "arn:role", false},
 		{"123456789abc", "arn:role", false}, // non-numeric
@@ -542,6 +440,7 @@ func setupRequestEnv(t *testing.T, home, serverURL, clientID, poolID string) []s
 	})
 	cache := tokencache.Cache{
 		IDToken:     idToken,
+		AccessToken: "test-access-token", // required for fast path after pitfall #5 fix
 		ExpiresAt:   time.Now().Add(1 * time.Hour),
 		AppClientID: clientID,
 		UserPoolID:  poolID,
@@ -641,7 +540,6 @@ func TestRequest_PolicyFetched_WhenAllFlagsProvided(t *testing.T) {
 	}
 }
 
-
 func TestRequestDirectFallback_FlagsCompleteSkipsRealtime(t *testing.T) {
 	home := t.TempDir()
 	rs := newDirectGrantServer(t)
@@ -660,5 +558,245 @@ func TestRequestDirectFallback_FlagsCompleteSkipsRealtime(t *testing.T) {
 	}
 	if strings.Contains(stderr, "entitlement autodiscovery") {
 		t.Fatalf("expected realtime to be skipped when flags complete, got stderr: %s", stderr)
+	}
+}
+
+// ---- Concurrent realtime subscription tests (pitfall #6) ----
+
+// orchestratorTestCfg builds a minimal config pointing at the given AppSync URL.
+// Other fields can be zero — requestOrchestrator only reads AppSyncEndpoint
+// (via the AppSync client) and FrontendURL (for the success-print suffix).
+func orchestratorTestCfg(appsyncURL string) *config.Config {
+	return &config.Config{
+		AppSyncEndpoint: appsyncURL,
+		FrontendURL:     appsyncURL,
+		AppClientID:     "test-client",
+		UserPoolID:      "us-east-1_test",
+		HostedUIDomain:  appsyncURL,
+	}
+}
+
+// orchestratorTestTokens returns a cache with non-empty AccessToken so the
+// realtime path is not gated by pitfall #5's access-token check.
+func orchestratorTestTokens() *tokencache.Cache {
+	return &tokencache.Cache{
+		IDToken:     "test-id",
+		AccessToken: "test-access",
+		UserID:      "u1",
+		GroupIDs:    []string{},
+		ExpiresAt:   time.Now().Add(time.Hour),
+	}
+}
+
+func orchestratorTestFlags(account, role string) requestFlags {
+	return requestFlags{
+		accountFlag:       account,
+		roleFlag:          role,
+		durationFlag:      "1",
+		justificationFlag: "test",
+		yes:               true,
+	}
+}
+
+// writeAppsyncJSON writes a minimal AppSync GraphQL response envelope.
+func writeAppsyncJSON(w http.ResponseWriter, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+// TestConcurrentSubscription_LaunchedBeforePolicyGetReturns verifies the
+// timing fix for pitfall #6: the WebSocket subscription goroutine must be
+// launched before policy.Get returns. Synchronization: the realtime mock
+// signals on entry; the getUserPolicy handler blocks until that signal,
+// proving the goroutine started concurrently. If the bug regresses (sequential
+// launch), the handler times out and the test fails.
+func TestConcurrentSubscription_LaunchedBeforePolicyGetReturns(t *testing.T) {
+	mockEntered := make(chan struct{}, 1)
+
+	orig := getRealtimeEntitlements
+	defer func() { getRealtimeEntitlements = orig }()
+	getRealtimeEntitlements = func(ctx context.Context, c *appsync.Client, uid string, gids []string) (*policy.Policy, error) {
+		mockEntered <- struct{}{}
+		return &policy.Policy{
+			Accounts:    []policy.Account{{ID: "343084147688", Name: "VU-Research-ISIS-ScopeLab"}},
+			Permissions: []policy.Permission{{ID: "arn:aws:sso:::permissionSet/ssoins/ps-x", Name: "VU_PowerUserAccess"}},
+		}, nil
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		switch {
+		case bytes.Contains(body, []byte("GetSettings")):
+			writeAppsyncJSON(w, map[string]any{"data": map[string]any{
+				"getSettings": map[string]any{"id": "settings", "duration": "8", "expiry": "30",
+					"comments": false, "ticketNo": false, "approval": false}}})
+		case bytes.Contains(body, []byte("GetUserPolicy")):
+			select {
+			case <-mockEntered:
+				// good — realtime started before getUserPolicy responded
+			case <-time.After(2 * time.Second):
+				t.Error("realtime mock was not entered before getUserPolicy was asked to respond — concurrency regression")
+			}
+			writeAppsyncJSON(w, map[string]any{"data": map[string]any{
+				"getUserPolicy": map[string]any{"id": "u1", "username": "user@example.com", "policy": nil}}})
+		case bytes.Contains(body, []byte("ValidateRequest")):
+			writeAppsyncJSON(w, map[string]any{"data": map[string]any{
+				"validateRequest": map[string]any{"valid": true, "reason": ""}}})
+		case bytes.Contains(body, []byte("CreateRequests")):
+			writeAppsyncJSON(w, map[string]any{"data": map[string]any{
+				"createRequests": map[string]any{"id": "req-1", "status": "pending"}}})
+		default:
+			http.Error(w, "unknown query", 400)
+		}
+	}))
+	defer srv.Close()
+
+	err := requestOrchestrator(context.Background(), orchestratorTestCfg(srv.URL), orchestratorTestTokens(),
+		orchestratorTestFlags("VU-Research-ISIS-ScopeLab", "VU_PowerUserAccess"))
+	if err != nil {
+		t.Fatalf("orchestrator returned unexpected error: %v", err)
+	}
+}
+
+// TestConcurrentSubscription_CancelledForGroupPolicyUser verifies that when
+// policy.Get reveals a group-policy user, the subscription goroutine is
+// cancelled promptly rather than waiting out realtimeEntitlementTimeout.
+func TestConcurrentSubscription_CancelledForGroupPolicyUser(t *testing.T) {
+	mockExited := make(chan error, 1)
+	orig := getRealtimeEntitlements
+	defer func() { getRealtimeEntitlements = orig }()
+	getRealtimeEntitlements = func(ctx context.Context, c *appsync.Client, uid string, gids []string) (*policy.Policy, error) {
+		<-ctx.Done()
+		err := ctx.Err()
+		mockExited <- err
+		return nil, err
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		switch {
+		case bytes.Contains(body, []byte("GetSettings")):
+			writeAppsyncJSON(w, map[string]any{"data": map[string]any{
+				"getSettings": map[string]any{"id": "settings", "duration": "8", "expiry": "30",
+					"comments": false, "ticketNo": false, "approval": false}}})
+		case bytes.Contains(body, []byte("GetUserPolicy")):
+			writeAppsyncJSON(w, map[string]any{"data": map[string]any{
+				"getUserPolicy": map[string]any{"id": "u1", "username": "user@example.com",
+					"policy": map[string]any{
+						"accounts":    []map[string]any{{"id": "343084147688", "name": "PolicyAccount"}},
+						"permissions": []map[string]any{{"id": "arn:perm", "name": "PolicyRole"}},
+					}}}})
+		case bytes.Contains(body, []byte("ValidateRequest")):
+			writeAppsyncJSON(w, map[string]any{"data": map[string]any{
+				"validateRequest": map[string]any{"valid": true, "reason": ""}}})
+		case bytes.Contains(body, []byte("CreateRequests")):
+			writeAppsyncJSON(w, map[string]any{"data": map[string]any{
+				"createRequests": map[string]any{"id": "req-1", "status": "pending"}}})
+		default:
+			http.Error(w, "unknown query", 400)
+		}
+	}))
+	defer srv.Close()
+
+	err := requestOrchestrator(context.Background(), orchestratorTestCfg(srv.URL), orchestratorTestTokens(),
+		orchestratorTestFlags("PolicyAccount", "PolicyRole"))
+	if err != nil {
+		t.Fatalf("orchestrator returned unexpected error: %v", err)
+	}
+	select {
+	case e := <-mockExited:
+		if !errors.Is(e, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got %v (DeadlineExceeded means cancel did not fire)", e)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("realtime goroutine not cancelled promptly after group-policy result")
+	}
+}
+
+// TestConcurrentSubscription_NotLaunchedForRawIDs verifies the optimization in
+// Decision 9: when both flags are raw IDs, no subscription goroutine is started.
+func TestConcurrentSubscription_NotLaunchedForRawIDs(t *testing.T) {
+	orig := getRealtimeEntitlements
+	defer func() { getRealtimeEntitlements = orig }()
+	getRealtimeEntitlements = func(ctx context.Context, c *appsync.Client, uid string, gids []string) (*policy.Policy, error) {
+		t.Error("realtime should not be called when both flags are raw IDs")
+		return nil, nil
+	}
+
+	// Raw-IDs path skips realtime, so the orchestrator falls through to prompt
+	// for the display name. Feed an empty line so it accepts the default (the ID).
+	origStdin := stdinReader
+	defer func() { stdinReader = origStdin }()
+	stdinReader = bufio.NewReader(strings.NewReader("\n"))
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		switch {
+		case bytes.Contains(body, []byte("GetSettings")):
+			writeAppsyncJSON(w, map[string]any{"data": map[string]any{
+				"getSettings": map[string]any{"id": "settings", "duration": "8", "expiry": "30",
+					"comments": false, "ticketNo": false, "approval": false}}})
+		case bytes.Contains(body, []byte("GetUserPolicy")):
+			writeAppsyncJSON(w, map[string]any{"data": map[string]any{
+				"getUserPolicy": map[string]any{"id": "u1", "username": "user@example.com", "policy": nil}}})
+		case bytes.Contains(body, []byte("ValidateRequest")):
+			writeAppsyncJSON(w, map[string]any{"data": map[string]any{
+				"validateRequest": map[string]any{"valid": true, "reason": ""}}})
+		case bytes.Contains(body, []byte("CreateRequests")):
+			writeAppsyncJSON(w, map[string]any{"data": map[string]any{
+				"createRequests": map[string]any{"id": "req-1", "status": "pending"}}})
+		default:
+			http.Error(w, "unknown query", 400)
+		}
+	}))
+	defer srv.Close()
+
+	err := requestOrchestrator(context.Background(), orchestratorTestCfg(srv.URL), orchestratorTestTokens(),
+		orchestratorTestFlags("123456789012", "arn:aws:sso:::permissionSet/ssoins-x/ps-y"))
+	if err != nil {
+		t.Fatalf("orchestrator returned unexpected error: %v", err)
+	}
+}
+
+// TestConcurrentSubscription_TransportFailureCancelsGoroutine verifies that
+// when policy.Get returns a transport error, deferred rtCancel still fires
+// and the realtime goroutine exits — confirming Decision 10's contract that
+// the orchestrator returns errors rather than calling os.Exit.
+func TestConcurrentSubscription_TransportFailureCancelsGoroutine(t *testing.T) {
+	mockExited := make(chan error, 1)
+	orig := getRealtimeEntitlements
+	defer func() { getRealtimeEntitlements = orig }()
+	getRealtimeEntitlements = func(ctx context.Context, c *appsync.Client, uid string, gids []string) (*policy.Policy, error) {
+		<-ctx.Done()
+		mockExited <- ctx.Err()
+		return nil, ctx.Err()
+	}
+
+	// Server returns 500 on GetUserPolicy. GetSettings must still succeed
+	// because it runs before policy.Get inside the orchestrator.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		switch {
+		case bytes.Contains(body, []byte("GetSettings")):
+			writeAppsyncJSON(w, map[string]any{"data": map[string]any{
+				"getSettings": map[string]any{"id": "settings", "duration": "8", "expiry": "30",
+					"comments": false, "ticketNo": false, "approval": false}}})
+		case bytes.Contains(body, []byte("GetUserPolicy")):
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			http.Error(w, "unknown query", 400)
+		}
+	}))
+	defer srv.Close()
+
+	err := requestOrchestrator(context.Background(), orchestratorTestCfg(srv.URL), orchestratorTestTokens(),
+		orchestratorTestFlags("VU-Research-ISIS-ScopeLab", "VU_PowerUserAccess"))
+	if err == nil {
+		t.Fatal("expected transport error to be returned, got nil (would have been os.Exit today)")
+	}
+	select {
+	case <-mockExited:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("realtime goroutine leaked after transport error")
 	}
 }
