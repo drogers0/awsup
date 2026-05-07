@@ -21,6 +21,7 @@ Download the binary for your platform from the [releases page](https://github.co
 curl -L https://github.com/drogers0/awsup/releases/latest/download/darwin-arm64 -o awsup
 chmod +x awsup
 mv awsup /usr/local/bin/
+awsup --version
 ```
 
 Verify the download against `checksums.txt` on the releases page.
@@ -98,6 +99,21 @@ Flags:
 | `--start <iso8601>` | Start time (default: now) |
 | `--yes` | Skip confirmation prompt |
 | `--json` | Output created request as JSON |
+
+### `awsup options`
+
+List the accounts and permission sets available to you for `awsup request`.
+
+```sh
+awsup options
+awsup options --json
+```
+
+Flags:
+
+| Flag | Description |
+|------|-------------|
+| `--json` | Output JSON |
 
 ### `awsup list`
 

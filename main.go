@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -58,8 +59,6 @@ type requestRecord struct {
 	Username        string  `json:"username"`
 	Approver        string  `json:"approver"`
 	ApproverID      string  `json:"approverId"`
-	Approvers       *string `json:"approvers"`
-	ApproverIDs     *string `json:"approver_ids"`
 	Revoker         string  `json:"revoker"`
 	RevokerID       string  `json:"revokerId"`
 	EndTime         string  `json:"endTime"`
@@ -87,7 +86,7 @@ mutation CreateRequests($input: CreateRequestsInput!, $condition: ModelRequestsC
   createRequests(input: $input, condition: $condition) {
     id email accountId accountName role roleId
     startTime duration justification status comment
-    username approver approverId approvers approver_ids
+    username approver approverId
     revoker revokerId endTime ticketNo revokeComment
     session_duration createdAt updatedAt owner __typename
   }
@@ -99,7 +98,7 @@ query RequestByEmailAndStatus($email: String!, $status: ModelStringKeyConditionI
     items {
       id email accountId accountName role roleId
       startTime duration justification status comment
-      username approver approverId approvers approver_ids
+      username approver approverId
       revoker revokerId endTime ticketNo revokeComment
       session_duration createdAt updatedAt owner __typename
     }
@@ -147,8 +146,9 @@ type createRequestsData struct {
 }
 
 type listRequestsVars struct {
-	Email     string  `json:"email"`
-	NextToken *string `json:"nextToken"`
+	Email         string  `json:"email"`
+	SortDirection string  `json:"sortDirection"`
+	NextToken     *string `json:"nextToken"`
 }
 
 type listRequestsPage struct {
@@ -804,8 +804,9 @@ Flags:
 	var nextToken *string
 	for {
 		data, err := appsync.Execute[listRequestsData](ctx, client, listRequestsQuery, listRequestsVars{
-			Email:     tokens.Email,
-			NextToken: nextToken,
+			Email:         tokens.Email,
+			SortDirection: "DESC",
+			NextToken:     nextToken,
 		})
 		checkTransportErr(err)
 
@@ -815,14 +816,7 @@ Flags:
 		if page.NextToken == nil || *page.NextToken == "" {
 			break
 		}
-		if *limit > 0 && len(all) >= *limit {
-			break
-		}
 		nextToken = page.NextToken
-	}
-
-	if *limit > 0 && len(all) > *limit {
-		all = all[:*limit]
 	}
 
 	if *statusFilter != "" {
@@ -833,6 +827,14 @@ Flags:
 			}
 		}
 		all = filtered
+	}
+
+	sort.Slice(all, func(i, j int) bool {
+		return all[i].CreatedAt > all[j].CreatedAt
+	})
+
+	if *limit > 0 && len(all) > *limit {
+		all = all[:*limit]
 	}
 
 	if *jsonOut {
