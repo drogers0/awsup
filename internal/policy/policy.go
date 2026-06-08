@@ -154,9 +154,8 @@ var wsDialContext = func(ctx context.Context, wsURL string, subprotocols []strin
 }
 
 // deriveRealtimeEndpoint converts an AppSync HTTPS endpoint to a WSS URL and
-// returns the Sec-WebSocket-Protocol subprotocols that carry the auth token.
-// token must be the Cognito access token (not the ID token) — AppSync rejects
-// the ID token on the WebSocket channel.
+// returns the Sec-WebSocket-Protocol subprotocols that carry the auth token
+// (a Cognito ID or access token — either is accepted on the WebSocket channel).
 func deriveRealtimeEndpoint(endpoint, token string) (wsURL, apiHost string, subprotocols []string, err error) {
 	u, parseErr := url.Parse(endpoint)
 	if parseErr != nil {
@@ -173,9 +172,12 @@ func deriveRealtimeEndpoint(endpoint, token string) (wsURL, apiHost string, subp
 	rtU := *u
 	rtU.Scheme = "wss"
 	rtU.Host = strings.Replace(u.Host, "appsync-api", "appsync-realtime-api", 1)
+	// RawURLEncoding (not StdEncoding): Sec-WebSocket-Protocol values are HTTP
+	// tokens and cannot contain '+', '/', or '=' padding, which AppSync rejects
+	// with "The request headers are invalid."
 	subprotocols = []string{
 		"graphql-ws",
-		"header-" + base64.StdEncoding.EncodeToString(headerJSON),
+		"header-" + base64.RawURLEncoding.EncodeToString(headerJSON),
 	}
 	return rtU.String(), apiHost, subprotocols, nil
 }
