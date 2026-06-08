@@ -53,40 +53,10 @@ func TestFetchAmplifyURLsSuccess(t *testing.T) {
 	if cfg.AppSyncEndpoint != "https://abc123def.appsync-api.us-east-1.amazonaws.com/graphql" {
 		t.Errorf("AppSyncEndpoint = %q", cfg.AppSyncEndpoint)
 	}
-	if cfg.HostedUIDomain != "https://team-prod.auth.us-east-1.amazoncognito.com" {
-		t.Errorf("HostedUIDomain = %q", cfg.HostedUIDomain)
-	}
 }
 
-func TestFetchAmplifyURLsPartialNoHostedUI(t *testing.T) {
-	bundle := `var x="https://abc123def.appsync-api.us-east-1.amazonaws.com/graphql";`
-	srv := amplifyServer(t, bundle)
-	defer srv.Close()
-
-	idTok := makeTestJWT(map[string]any{
-		"iss": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_TestPool",
-	})
-	s := auth.RawSession{AppClientID: "c", FrontendURL: srv.URL, IDToken: idTok}
-	cfg, err := config.DiscoverFromSession("default", s)
-	if cfg == nil {
-		t.Fatal("expected non-nil Config on partial discovery")
-	}
-	if cfg.AppSyncEndpoint == "" {
-		t.Error("AppSyncEndpoint should be populated")
-	}
-	if cfg.HostedUIDomain != "" {
-		t.Errorf("HostedUIDomain should be empty, got %q", cfg.HostedUIDomain)
-	}
-	if err == nil {
-		t.Error("expected error for missing HostedUIDomain")
-	}
-	if !strings.Contains(err.Error(), "TEAM_COGNITO_HOSTED_UI_DOMAIN") {
-		t.Errorf("error should name the missing field: %v", err)
-	}
-}
-
-func TestFetchAmplifyURLsPartialNoAppSync(t *testing.T) {
-	bundle := `var y="team-prod.auth.us-east-1.amazoncognito.com";`
+func TestFetchAmplifyURLsNoAppSync(t *testing.T) {
+	bundle := `var y="nothing-useful-here";`
 	srv := amplifyServer(t, bundle)
 	defer srv.Close()
 
@@ -100,9 +70,6 @@ func TestFetchAmplifyURLsPartialNoAppSync(t *testing.T) {
 	}
 	if cfg.AppSyncEndpoint != "" {
 		t.Errorf("AppSyncEndpoint should be empty, got %q", cfg.AppSyncEndpoint)
-	}
-	if cfg.HostedUIDomain == "" {
-		t.Error("HostedUIDomain should be populated")
 	}
 	if err == nil {
 		t.Error("expected error for missing AppSyncEndpoint")
@@ -145,9 +112,8 @@ func TestDiscoverFromSession_PartialFetch_NoBundleRef(t *testing.T) {
 	if cfg.AmplifyUserAgent != config.DefaultAmplifyUserAgent {
 		t.Errorf("AmplifyUserAgent = %q", cfg.AmplifyUserAgent)
 	}
-	if cfg.AppSyncEndpoint != "" || cfg.HostedUIDomain != "" {
-		t.Errorf("network-derived fields should be empty: appsync=%q hostedUI=%q",
-			cfg.AppSyncEndpoint, cfg.HostedUIDomain)
+	if cfg.AppSyncEndpoint != "" {
+		t.Errorf("network-derived field should be empty: appsync=%q", cfg.AppSyncEndpoint)
 	}
 }
 
@@ -169,9 +135,8 @@ func TestDiscoverFromSession_Unreachable(t *testing.T) {
 	if err == nil {
 		t.Error("expected error for unreachable frontend")
 	}
-	if cfg.AppSyncEndpoint != "" || cfg.HostedUIDomain != "" {
-		t.Errorf("fields should be empty on unreachable fetch: appsync=%q hostedUI=%q",
-			cfg.AppSyncEndpoint, cfg.HostedUIDomain)
+	if cfg.AppSyncEndpoint != "" {
+		t.Errorf("field should be empty on unreachable fetch: appsync=%q", cfg.AppSyncEndpoint)
 	}
 	// Locally-derived fields populated.
 	if cfg.AppClientID != "client-x" || cfg.UserPoolID != "us-east-1_TestPool" {

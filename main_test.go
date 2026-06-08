@@ -424,7 +424,6 @@ func setupRequestEnv(t *testing.T, home, serverURL, clientID, poolID string) []s
 		"TEAM_APPSYNC_ENDPOINT=" + serverURL,
 		"TEAM_FRONTEND_URL=" + serverURL,
 		"TEAM_COGNITO_USER_POOL_ID=" + poolID,
-		"TEAM_COGNITO_HOSTED_UI_DOMAIN=" + serverURL,
 	}, "\n") + "\n"
 	if err := os.WriteFile(filepath.Join(cfgDir, "default.env"), []byte(envContent), 0600); err != nil {
 		t.Fatal(err)
@@ -572,7 +571,6 @@ func orchestratorTestCfg(appsyncURL string) *config.Config {
 		FrontendURL:     appsyncURL,
 		AppClientID:     "test-client",
 		UserPoolID:      "us-east-1_test",
-		HostedUIDomain:  appsyncURL,
 	}
 }
 

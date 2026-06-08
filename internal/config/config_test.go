@@ -23,7 +23,6 @@ func clearRequiredEnv(t *testing.T) {
 		"TEAM_APPSYNC_ENDPOINT",
 		"TEAM_FRONTEND_URL",
 		"TEAM_COGNITO_USER_POOL_ID",
-		"TEAM_COGNITO_HOSTED_UI_DOMAIN",
 		"TEAM_AMPLIFY_USER_AGENT",
 	} {
 		t.Setenv(k, "")
@@ -34,11 +33,10 @@ func clearRequiredEnv(t *testing.T) {
 func TestLoad_EnvOverride(t *testing.T) {
 	clearRequiredEnv(t)
 	setRequiredEnv(t, map[string]string{
-		"TEAM_COGNITO_APP_CLIENT_ID":    "test-client-id",
-		"TEAM_APPSYNC_ENDPOINT":         "https://test.appsync.amazonaws.com/graphql",
-		"TEAM_FRONTEND_URL":             "https://test.example.com",
-		"TEAM_COGNITO_USER_POOL_ID":     "us-east-1_test",
-		"TEAM_COGNITO_HOSTED_UI_DOMAIN": "https://auth.test.amazoncognito.com",
+		"TEAM_COGNITO_APP_CLIENT_ID": "test-client-id",
+		"TEAM_APPSYNC_ENDPOINT":      "https://test.appsync.amazonaws.com/graphql",
+		"TEAM_FRONTEND_URL":          "https://test.example.com",
+		"TEAM_COGNITO_USER_POOL_ID":  "us-east-1_test",
 	})
 
 	cfg, err := config.Load("test-profile-env")
@@ -70,25 +68,6 @@ func TestLoad_MissingRequired(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q missing expected var %q", err.Error(), want)
 		}
-	}
-}
-
-func TestLoad_HostedUIDomain_PrependHTTPS(t *testing.T) {
-	clearRequiredEnv(t)
-	setRequiredEnv(t, map[string]string{
-		"TEAM_COGNITO_APP_CLIENT_ID":    "cid",
-		"TEAM_APPSYNC_ENDPOINT":         "https://appsync.example.com/graphql",
-		"TEAM_FRONTEND_URL":             "https://frontend.example.com",
-		"TEAM_COGNITO_USER_POOL_ID":     "us-east-1_pool",
-		"TEAM_COGNITO_HOSTED_UI_DOMAIN": "auth.example.amazoncognito.com",
-	})
-
-	cfg, err := config.Load("test-profile-https")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.HostedUIDomain != "https://auth.example.amazoncognito.com" {
-		t.Errorf("HostedUIDomain = %q, want https:// prefix", cfg.HostedUIDomain)
 	}
 }
 

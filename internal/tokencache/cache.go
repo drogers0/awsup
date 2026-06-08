@@ -99,6 +99,8 @@ func Refresh(c *Cache, endpoint string) (*Cache, error) {
 		endpoint = idpEndpointFor(c.UserPoolID)
 	}
 
+	// No SECRET_HASH: TEAM's app client is a public SPA client with no secret,
+	// matching what the web app sends.
 	reqBody, err := json.Marshal(initiateAuthRequest{
 		AuthFlow:       "REFRESH_TOKEN_AUTH",
 		ClientID:       c.AppClientID,

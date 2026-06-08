@@ -154,6 +154,18 @@ func TestGetValid_ExpiredIDToken_ValidRefresh(t *testing.T) {
 	}
 }
 
+func TestIdpEndpointFor(t *testing.T) {
+	cases := map[string]string{
+		"us-east-1_abc123": "https://cognito-idp.us-east-1.amazonaws.com/",
+		"eu-west-2_XyZ":    "https://cognito-idp.eu-west-2.amazonaws.com/",
+	}
+	for poolID, want := range cases {
+		if got := idpEndpointFor(poolID); got != want {
+			t.Errorf("idpEndpointFor(%q) = %q, want %q", poolID, got, want)
+		}
+	}
+}
+
 func TestGetValid_RefreshRejected_NoBrowser(t *testing.T) {
 	// Server rejects the refresh token (as Cognito does for an expired one).
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

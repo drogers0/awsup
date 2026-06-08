@@ -980,7 +980,6 @@ Flags:
 		{"TEAM_COGNITO_USER_POOL_ID", cfg.UserPoolID},
 		{"TEAM_FRONTEND_URL", cfg.FrontendURL},
 		{"TEAM_APPSYNC_ENDPOINT", cfg.AppSyncEndpoint},
-		{"TEAM_COGNITO_HOSTED_UI_DOMAIN", cfg.HostedUIDomain},
 	}
 
 	// Single pass: build the file content (raw values) and print to stdout
