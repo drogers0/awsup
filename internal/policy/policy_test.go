@@ -2,6 +2,7 @@ package policy
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -13,6 +14,51 @@ import (
 	"github.com/drogers0/awsup/internal/appsync"
 	"github.com/gorilla/websocket"
 )
+
+// TestDeriveRealtimeEndpoint_SubprotocolEncoding guards against regressing the
+// auth subprotocol to standard base64: AppSync rejects the handshake with
+// "The request headers are invalid." when the Sec-WebSocket-Protocol value
+// contains '+', '/', or '=' (it must be URL-safe, unpadded).
+func TestDeriveRealtimeEndpoint_SubprotocolEncoding(t *testing.T) {
+	// A realistic-length token guarantees base64 output that would contain
+	// '+'/'/'/'=' under StdEncoding.
+	token := "eyJhbGciOiJ" + strings.Repeat("AbC?>+/_-=129", 120) + ".sig"
+	endpoint := "https://abc123.appsync-api.us-east-1.amazonaws.com/graphql"
+
+	wsURL, apiHost, subs, err := deriveRealtimeEndpoint(endpoint, token)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.HasPrefix(wsURL, "wss://abc123.appsync-realtime-api.us-east-1.amazonaws.com/graphql") {
+		t.Errorf("wsURL = %q", wsURL)
+	}
+	if len(subs) != 2 || subs[0] != "graphql-ws" {
+		t.Fatalf("subprotocols = %v", subs)
+	}
+	enc := strings.TrimPrefix(subs[1], "header-")
+	if enc == subs[1] {
+		t.Fatalf("second subprotocol missing header- prefix: %q", subs[1])
+	}
+	for _, c := range enc {
+		if c == '+' || c == '/' || c == '=' {
+			t.Fatalf("subprotocol has invalid WS token char %q in %q", c, enc)
+		}
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(enc)
+	if err != nil {
+		t.Fatalf("subprotocol not RawURLEncoding-decodable: %v", err)
+	}
+	var m map[string]string
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("decoded auth header not JSON: %v", err)
+	}
+	if m["Authorization"] != token {
+		t.Errorf("Authorization = %q, want token", m["Authorization"])
+	}
+	if m["host"] != apiHost || apiHost != "abc123.appsync-api.us-east-1.amazonaws.com" {
+		t.Errorf("host = %q, apiHost = %q", m["host"], apiHost)
+	}
+}
 
 func newTestClient(srv *httptest.Server) *appsync.Client {
 	return appsync.New(srv.URL, "https://example.com", "test-agent", "test-token")
