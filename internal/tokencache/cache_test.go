@@ -108,11 +108,13 @@ func TestGetValid_ExpiredIDToken_ValidRefresh(t *testing.T) {
 	)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		// Note: no expires_in — Refresh derives expiry from the JWT exp claim.
+		w.Header().Set("Content-Type", "application/x-amz-json-1.1")
+		// InitiateAuth response shape. Refresh derives expiry from the JWT exp.
 		json.NewEncoder(w).Encode(map[string]any{
-			"id_token":     jwt,
-			"access_token": "access-token-value",
+			"AuthenticationResult": map[string]any{
+				"IdToken":     jwt,
+				"AccessToken": "access-token-value",
+			},
 		})
 	}))
 	defer srv.Close()
@@ -149,6 +151,36 @@ func TestGetValid_ExpiredIDToken_ValidRefresh(t *testing.T) {
 	}
 	if got.ExpiresAt.Unix() != knownExp {
 		t.Errorf("ExpiresAt = %d, want %d (from JWT exp)", got.ExpiresAt.Unix(), knownExp)
+	}
+}
+
+func TestGetValid_RefreshRejected_NoBrowser(t *testing.T) {
+	// Server rejects the refresh token (as Cognito does for an expired one).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]any{"__type": "NotAuthorizedException"})
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "creds.json")
+
+	expired := &Cache{
+		IDToken:      "hdr.e30.sig",
+		RefreshToken: "dead-refresh-tok",
+		ExpiresAt:    time.Now().Add(-1 * time.Hour),
+		AppClientID:  "test-client",
+		UserPoolID:   "us-east-1_test",
+	}
+	if err := Save(path, expired); err != nil {
+		t.Fatal(err)
+	}
+
+	// Refresh fails and there is no browser session in the test env. The error
+	// should be the honest ErrSessionExpired, not ErrNoSession.
+	_, err := GetValid(path, "test-client", "us-east-1_test", srv.URL)
+	if !errors.Is(err, ErrSessionExpired) {
+		t.Errorf("expected ErrSessionExpired, got %v", err)
 	}
 }
 

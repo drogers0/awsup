@@ -172,7 +172,7 @@ func mustLoadConfig(profile string) *config.Config {
 }
 
 func mustGetTokens(cfg *config.Config) *tokencache.Cache {
-	cache, err := tokencache.GetValid(cfg.CachePath(), cfg.AppClientID, cfg.UserPoolID, cfg.HostedUIDomain)
+	cache, err := tokencache.GetValid(cfg.CachePath(), cfg.AppClientID, cfg.UserPoolID, "")
 	if err != nil {
 		if errors.Is(err, auth.ErrNoSession) || errors.Is(err, tokencache.ErrSessionExpired) {
 			fmt.Fprintln(os.Stderr, "Error: "+err.Error())
