@@ -172,7 +172,7 @@ func mustLoadConfig(profile string) *config.Config {
 }
 
 func mustGetTokens(cfg *config.Config) *tokencache.Cache {
-	cache, err := tokencache.GetValid(cfg.CachePath(), cfg.AppClientID, cfg.UserPoolID, cfg.HostedUIDomain)
+	cache, err := tokencache.GetValid(cfg.CachePath(), cfg.AppClientID, cfg.UserPoolID, "")
 	if err != nil {
 		if errors.Is(err, auth.ErrNoSession) || errors.Is(err, tokencache.ErrSessionExpired) {
 			fmt.Fprintln(os.Stderr, "Error: "+err.Error())
@@ -980,7 +980,6 @@ Flags:
 		{"TEAM_COGNITO_USER_POOL_ID", cfg.UserPoolID},
 		{"TEAM_FRONTEND_URL", cfg.FrontendURL},
 		{"TEAM_APPSYNC_ENDPOINT", cfg.AppSyncEndpoint},
-		{"TEAM_COGNITO_HOSTED_UI_DOMAIN", cfg.HostedUIDomain},
 	}
 
 	// Single pass: build the file content (raw values) and print to stdout

@@ -1,11 +1,11 @@
 package tokencache
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,28 +64,62 @@ func Save(path string, c *Cache) error {
 	return nil
 }
 
-// refreshResponse is the JSON body returned by the Cognito token endpoint.
-type refreshResponse struct {
-	IDToken     string `json:"id_token"`
-	AccessToken string `json:"access_token"`
+// initiateAuthRequest is the InitiateAuth REFRESH_TOKEN_AUTH request body.
+type initiateAuthRequest struct {
+	AuthFlow       string            `json:"AuthFlow"`
+	ClientID       string            `json:"ClientId"`
+	AuthParameters map[string]string `json:"AuthParameters"`
 }
 
-// Refresh obtains a new ID token using c.RefreshToken against the hosted UI
-// token endpoint. hostedUIDomain must be a full base URL, e.g.
-// "https://auth.example.auth.us-east-1.amazoncognito.com". In tests, pass the
-// httptest.Server URL directly. Returns ErrSessionExpired on a non-200
-// response.
-func Refresh(c *Cache, hostedUIDomain string) (*Cache, error) {
-	tokenURL := strings.TrimRight(hostedUIDomain, "/") + "/oauth2/token"
+// initiateAuthResponse is the subset of the InitiateAuth response we consume.
+// Cognito does not return a new refresh token here (the existing one is reused).
+type initiateAuthResponse struct {
+	AuthenticationResult struct {
+		IDToken     string `json:"IdToken"`
+		AccessToken string `json:"AccessToken"`
+	} `json:"AuthenticationResult"`
+}
 
-	vals := url.Values{}
-	vals.Set("grant_type", "refresh_token")
-	vals.Set("client_id", c.AppClientID)
-	vals.Set("refresh_token", c.RefreshToken)
+// idpEndpointFor returns the Cognito Identity Provider base URL for a user pool
+// ID of the form "<region>_<id>", e.g. "https://cognito-idp.us-east-1.amazonaws.com/".
+func idpEndpointFor(userPoolID string) string {
+	region, _, _ := strings.Cut(userPoolID, "_")
+	return "https://cognito-idp." + region + ".amazonaws.com/"
+}
 
-	resp, err := http.PostForm(tokenURL, vals)
+// Refresh obtains new ID and access tokens from c.RefreshToken via the Cognito
+// Identity Provider InitiateAuth API (REFRESH_TOKEN_AUTH flow) — the same
+// mechanism the TEAM web app uses. This works for IAM Identity Center-federated
+// sessions, which the Hosted UI /oauth2/token endpoint rejects with
+// invalid_grant. endpoint is the cognito-idp base URL; when empty it is derived
+// from c.UserPoolID. In tests, pass an httptest.Server URL. Returns
+// ErrSessionExpired on a non-200 response (e.g. an expired refresh token).
+func Refresh(c *Cache, endpoint string) (*Cache, error) {
+	if endpoint == "" {
+		endpoint = idpEndpointFor(c.UserPoolID)
+	}
+
+	// No SECRET_HASH: TEAM's app client is a public SPA client with no secret,
+	// matching what the web app sends.
+	reqBody, err := json.Marshal(initiateAuthRequest{
+		AuthFlow:       "REFRESH_TOKEN_AUTH",
+		ClientID:       c.AppClientID,
+		AuthParameters: map[string]string{"REFRESH_TOKEN": c.RefreshToken},
+	})
 	if err != nil {
-		return nil, fmt.Errorf("token refresh request: %w", err)
+		return nil, fmt.Errorf("encoding InitiateAuth request: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("building InitiateAuth request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-amz-json-1.1")
+	req.Header.Set("X-Amz-Target", "AWSCognitoIdentityProviderService.InitiateAuth")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("InitiateAuth request: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -93,19 +127,22 @@ func Refresh(c *Cache, hostedUIDomain string) (*Cache, error) {
 		return nil, ErrSessionExpired
 	}
 
-	var rr refreshResponse
-	if err := json.NewDecoder(resp.Body).Decode(&rr); err != nil {
-		return nil, fmt.Errorf("decoding token response: %w", err)
+	var ir initiateAuthResponse
+	if err := json.NewDecoder(resp.Body).Decode(&ir); err != nil {
+		return nil, fmt.Errorf("decoding InitiateAuth response: %w", err)
+	}
+	if ir.AuthenticationResult.IDToken == "" {
+		return nil, ErrSessionExpired
 	}
 
-	tokens, err := auth.ParseTokenClaims(rr.IDToken, c.AppClientID)
+	tokens, err := auth.ParseTokenClaims(ir.AuthenticationResult.IDToken, c.AppClientID)
 	if err != nil {
-		return nil, fmt.Errorf("parsing refreshed id_token: %w", err)
+		return nil, fmt.Errorf("parsing refreshed IdToken: %w", err)
 	}
 
 	newCache := &Cache{
-		IDToken:      rr.IDToken,
-		AccessToken:  rr.AccessToken,
+		IDToken:      ir.AuthenticationResult.IDToken,
+		AccessToken:  ir.AuthenticationResult.AccessToken,
 		RefreshToken: c.RefreshToken,
 		ExpiresAt:    tokens.Expiry,
 		UserPoolID:   c.UserPoolID,
@@ -121,9 +158,12 @@ func Refresh(c *Cache, hostedUIDomain string) (*Cache, error) {
 // GetValid returns a valid cache for the given profile parameters. It:
 //  1. Loads the cache file; discards it on AppClientID/UserPoolID mismatch.
 //  2. Returns the cached value if the ID token has > 60 seconds remaining.
-//  3. Tries to refresh if a refresh token is present.
+//  3. Tries to refresh via InitiateAuth if a refresh token is present.
 //  4. Falls back to auth.FromBrowser.
-func GetValid(cachePath, appClientID, userPoolID, hostedUIDomain string) (*Cache, error) {
+//
+// idpEndpoint is the cognito-idp base URL passed through to Refresh; when empty
+// it is derived from userPoolID. Tests pass an httptest.Server URL.
+func GetValid(cachePath, appClientID, userPoolID, idpEndpoint string) (*Cache, error) {
 	c, err := Load(cachePath)
 	if err != nil {
 		return nil, err
@@ -138,20 +178,27 @@ func GetValid(cachePath, appClientID, userPoolID, hostedUIDomain string) (*Cache
 		return c, nil
 	}
 
+	var refreshErr error
 	if c != nil && c.RefreshToken != "" {
-		refreshed, err := Refresh(c, hostedUIDomain)
+		refreshed, err := Refresh(c, idpEndpoint)
 		if err == nil {
 			if saveErr := Save(cachePath, refreshed); saveErr != nil {
 				return nil, saveErr
 			}
 			return refreshed, nil
 		}
-		// Fall through to browser on refresh failure.
+		// Remember why refresh failed; fall through to browser extraction.
+		refreshErr = err
 	}
 
 	// Fall back to browser extraction.
 	tokens, err := auth.FromBrowser(appClientID)
 	if err != nil {
+		// If we had a refresh token that the server rejected, the session has
+		// genuinely expired — that is more accurate than "no browser session".
+		if refreshErr != nil && errors.Is(err, auth.ErrNoSession) {
+			return nil, refreshErr
+		}
 		return nil, err
 	}
 	fresh := &Cache{

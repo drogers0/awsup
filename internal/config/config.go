@@ -20,7 +20,6 @@ type Config struct {
 	AppSyncEndpoint  string // TEAM_APPSYNC_ENDPOINT
 	FrontendURL      string // TEAM_FRONTEND_URL
 	UserPoolID       string // TEAM_COGNITO_USER_POOL_ID
-	HostedUIDomain   string // TEAM_COGNITO_HOSTED_UI_DOMAIN (full base URL)
 	AmplifyUserAgent string // TEAM_AMPLIFY_USER_AGENT
 }
 
@@ -70,19 +69,11 @@ func Load(profile string) (*Config, error) {
 		AppSyncEndpoint:  get("TEAM_APPSYNC_ENDPOINT"),
 		FrontendURL:      get("TEAM_FRONTEND_URL"),
 		UserPoolID:       get("TEAM_COGNITO_USER_POOL_ID"),
-		HostedUIDomain:   get("TEAM_COGNITO_HOSTED_UI_DOMAIN"),
 		AmplifyUserAgent: get("TEAM_AMPLIFY_USER_AGENT"),
 	}
 
 	if cfg.AmplifyUserAgent == "" {
 		cfg.AmplifyUserAgent = DefaultAmplifyUserAgent
-	}
-
-	// Normalize HostedUIDomain: ensure scheme is present.
-	if cfg.HostedUIDomain != "" &&
-		!strings.HasPrefix(cfg.HostedUIDomain, "https://") &&
-		!strings.HasPrefix(cfg.HostedUIDomain, "http://") {
-		cfg.HostedUIDomain = "https://" + cfg.HostedUIDomain
 	}
 
 	var missing []string
@@ -97,9 +88,6 @@ func Load(profile string) (*Config, error) {
 	}
 	if cfg.UserPoolID == "" {
 		missing = append(missing, "TEAM_COGNITO_USER_POOL_ID")
-	}
-	if cfg.HostedUIDomain == "" {
-		missing = append(missing, "TEAM_COGNITO_HOSTED_UI_DOMAIN")
 	}
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing required config vars: %s", strings.Join(missing, ", "))
